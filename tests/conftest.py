@@ -39,6 +39,15 @@ def adapter_instance(adapter_module):
     adapter._last_msg_id_ts = {}
     adapter._running = True
     adapter._ws = types.SimpleNamespace(closed=False)
+    adapter._http_client = types.SimpleNamespace(put=None)
+    adapter._markdown_support = True
+    adapter._dm_policy = "pairing"
+    adapter._allow_from = []
+    adapter._group_policy = "allowlist"
+    adapter._group_allow_from = ["GROUP"]
+    adapter._group_member_allow_from = []
+    adapter._seen_messages = {}
+    adapter._upload_cache = {}
     adapter.MAX_MESSAGE_LENGTH = 4000
     adapter.format_message = lambda text: text
     adapter.truncate_message = lambda text, limit: [text]

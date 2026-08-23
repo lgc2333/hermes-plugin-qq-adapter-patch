@@ -255,11 +255,13 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
         self._group_allow_from = _coerce_list(
             extra.get("group_allow_from") or extra.get("groupAllowFrom")
         )
-        self._group_member_allow_from = _coerce_list(
-            extra.get("group_member_allow_from")
-            or extra.get("groupMemberAllowFrom")
-            or _resolve_qq_secret("QQ_GROUP_ALLOWED_MEMBERS", "")
-        )
+        if "group_member_allow_from" in extra:
+            group_member_allow_value = extra.get("group_member_allow_from")
+        elif "groupMemberAllowFrom" in extra:
+            group_member_allow_value = extra.get("groupMemberAllowFrom")
+        else:
+            group_member_allow_value = _resolve_qq_secret("QQ_GROUP_ALLOWED_MEMBERS", "")
+        self._group_member_allow_from = _coerce_list(group_member_allow_value)
 
         # Connection state
         self._session: Optional[aiohttp.ClientSession] = None
@@ -2536,9 +2538,9 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
         # private replies to /v2/groups/<openid>/messages.
         known_chat_type = self._chat_type_map.get(chat_id)
         fallback_member_openid: Optional[str] = None
-        allow_legacy_fallback = True
+        allow_legacy_fallback = False
         if known_chat_type != "c2c":
-            fallback_member_openid, allow_legacy_fallback = self._resolve_group_fallback_member(
+            fallback_member_openid, _authoritative = self._resolve_group_fallback_member(
                 chat_id, content, reply_to, metadata
             )
 
@@ -2557,7 +2559,7 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
             fallback_member_openid = self._member_for_reply_anchor(chat_id, reply_to)
             if fallback_member_openid:
                 self._chat_type_map[chat_id] = "group"
-                allow_legacy_fallback = True
+                allow_legacy_fallback = False
 
         if not self.is_connected:
             if not await self._wait_for_reconnection():
@@ -2598,7 +2600,7 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
             content: str,
             *,
             member_openid: Optional[str] = None,
-            allow_legacy_fallback: bool = True,
+            allow_legacy_fallback: bool = False,
     ) -> Optional[SendResult]:
         """Send a failed group reply as a private DM.
 
@@ -2807,7 +2809,7 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
             reply_to: Optional[str] = None,
             *,
             fallback_member_openid: Optional[str] = None,
-            allow_legacy_fallback: bool = True,
+            allow_legacy_fallback: bool = False,
     ) -> SendResult:
         """Send a single text message with an inline keyboard attached.
 
@@ -2867,7 +2869,7 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
             reply_to: Optional[str] = None,
             *,
             fallback_member_openid: Optional[str] = None,
-            allow_legacy_fallback: bool = True,
+            allow_legacy_fallback: bool = False,
     ) -> SendResult:
         """Send a 3-button approval request (``allow-once / allow-always / deny``).
 
@@ -2925,21 +2927,13 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
         fallback_member_openid = self._metadata_group_member(chat_id, metadata)
         if not fallback_member_openid:
             fallback_member_openid = self._session_member_from_key(session_key, chat_id)
-        allow_legacy_fallback = fallback_member_openid is None
+        allow_legacy_fallback = False
         if fallback_member_openid:
             self._chat_type_map[chat_id] = "group"
 
-        # Use a response-specific passive context when possible.  For group
-        # approvals, prefer the triggering member's recent C2C msg_id over the
-        # group's last msg_id so approval fallback cannot target the wrong user.
-        msg_id = None
-        if fallback_member_openid:
-            c2c_msg_id = self._last_msg_id.get(fallback_member_openid)
-            c2c_ts = self._last_msg_id_ts.get(fallback_member_openid, 0.0)
-            if c2c_msg_id and (time.time() - c2c_ts) <= 300.0:
-                msg_id = c2c_msg_id
-        if not msg_id:
-            msg_id = self._last_msg_id.get(chat_id)
+        # Group sends must only reply to group msg_ids. C2C msg_ids are valid
+        # only for the later DM fallback path in _send_fallback_dm().
+        msg_id = self._last_msg_id.get(chat_id)
 
         req = ApprovalRequest(
             session_key=session_key,
@@ -2986,17 +2980,33 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
         ``~/.hermes/.update_response`` so the detached update process
         can read it.
         """
-        del session_key, metadata  # present for contract parity only.
-
         default_hint = f" (default: {default})" if default else ""
         content = f"⚕ **Update Needs Your Input**\n\n{prompt}{default_hint}"
+        fallback_member_openid = self._metadata_group_member(chat_id, metadata)
+        if not fallback_member_openid:
+            fallback_member_openid = self._session_member_from_key(session_key, chat_id)
+        allow_legacy_fallback = False
+        if fallback_member_openid:
+            self._chat_type_map[chat_id] = "group"
         msg_id = self._last_msg_id.get(chat_id)
-        return await self.send_with_keyboard(
-            chat_id,
-            content,
-            build_update_prompt_keyboard(),
-            reply_to=msg_id,
-        )
+        try:
+            return await self.send_with_keyboard(
+                chat_id,
+                content,
+                build_update_prompt_keyboard(),
+                reply_to=msg_id,
+                fallback_member_openid=fallback_member_openid,
+                allow_legacy_fallback=allow_legacy_fallback,
+            )
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            return await self.send_with_keyboard(
+                chat_id,
+                content,
+                build_update_prompt_keyboard(),
+                reply_to=msg_id,
+            )
 
     def _build_text_body(
             self, content: str, reply_to: Optional[str] = None
