@@ -2949,13 +2949,22 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
             timeout_sec=self._APPROVAL_TIMEOUT_SECONDS,
             allow_permanent=allow_permanent and not smart_denied,
         )
-        return await self.send_approval_request(
-            chat_id,
-            req,
-            reply_to=msg_id,
-            fallback_member_openid=fallback_member_openid,
-            allow_legacy_fallback=allow_legacy_fallback,
-        )
+        try:
+            return await self.send_approval_request(
+                chat_id,
+                req,
+                reply_to=msg_id,
+                fallback_member_openid=fallback_member_openid,
+                allow_legacy_fallback=allow_legacy_fallback,
+            )
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            return await self.send_approval_request(
+                chat_id,
+                req,
+                reply_to=msg_id,
+            )
 
     _APPROVAL_TIMEOUT_SECONDS = 300  # matches gateway's default gateway_timeout
 
@@ -3688,6 +3697,9 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
             return True
         self._seen_messages[msg_id] = now
         return False
+
+
+QQAdapter = QQAdapterPatchAdapter
 
 
 # ---------------------------------------------------------------------------

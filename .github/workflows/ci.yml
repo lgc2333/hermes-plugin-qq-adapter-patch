@@ -52,6 +52,16 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/hermes:${{ github.workspace }}/plugin
         run: uv run hermes plugins doctor ${{ github.workspace }}/plugin
 
+      - name: Install plugin adapter over upstream QQ adapter for upstream tests
+        run: |
+          cp plugin/adapter.py hermes/gateway/platforms/qqbot/adapter.py
+
+      - name: Upstream QQ adapter tests with plugin adapter
+        working-directory: hermes
+        env:
+          PYTHONPATH: ${{ github.workspace }}/hermes:${{ github.workspace }}/plugin
+        run: uv run pytest -q tests/gateway/test_qqbot.py tests/gateway/test_qqbot_credential_isolation.py tests/gateway/test_qqbot_scope_paths.py
+
       - name: Plugin tests
         working-directory: plugin
         env:

@@ -96,3 +96,24 @@ def test_metadata_group_member_requires_matching_chat_id(adapter_instance):
     )
     assert ok == "MEMBER_A"
     assert adapter_instance._chat_type_map["GROUP_A"] == "group"
+
+
+async def test_send_exec_approval_accepts_old_send_approval_override(adapter_instance):
+    calls = []
+
+    async def old_send_approval(chat_id, req, reply_to=None):
+        calls.append((chat_id, req.session_key, reply_to))
+        return SendResult(success=True, message_id="approval")
+
+    adapter_instance.send_approval_request = old_send_approval
+    adapter_instance._last_msg_id["user-1"] = "inbound-42"
+
+    result = await adapter_instance.send_exec_approval(
+        chat_id="user-1",
+        command="rm -rf /tmp/demo",
+        session_key="sess:abc",
+        description="delete temp dir",
+    )
+
+    assert result.success
+    assert calls == [("user-1", "sess:abc", "inbound-42")]

@@ -73,7 +73,15 @@ From this repo, with Hermes source available at `/opt/hermes`:
 PYTHONPATH=/opt/hermes /opt/hermes/.venv/bin/python -m pytest -q tests
 ```
 
-The GitHub Actions workflow checks out Hermes, installs its dev + messaging dependencies, runs an upstream QQ adapter import smoke test, then runs this plugin's tests.
+The GitHub Actions workflow checks out Hermes, installs its dev + messaging dependencies, runs an upstream QQ adapter import smoke test, verifies this directory plugin with `hermes plugins doctor`, overlays `adapter.py` onto Hermes' `gateway/platforms/qqbot/adapter.py`, then runs the upstream QQ-related tests:
+
+```text
+tests/gateway/test_qqbot.py
+tests/gateway/test_qqbot_credential_isolation.py
+tests/gateway/test_qqbot_scope_paths.py
+```
+
+Finally, it runs this plugin's own regression tests.
 
 ## Notes
 
