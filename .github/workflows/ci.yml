@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+        with:
+          path: plugin
+
+      - name: Checkout Hermes
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          path: hermes
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Hermes test dependencies
+        working-directory: hermes
+        run: uv sync --locked --extra dev --extra messaging
+
+      - name: Upstream QQ adapter import smoke
+        working-directory: hermes
+        run: |
+          uv run python - <<'PY'
+          from gateway.platforms.qqbot import QQAdapter, check_qq_requirements
+          assert QQAdapter is not None
+          assert check_qq_requirements()
+          print('upstream qqbot import smoke ok')
+          PY
+
+      - name: Plugin doctor
+        working-directory: hermes
+        env:
+          PYTHONPATH: ${{ github.workspace }}/hermes:${{ github.workspace }}/plugin
+        run: uv run hermes plugins doctor ${{ github.workspace }}/plugin
+
+      - name: Plugin tests
+        working-directory: plugin
+        env:
+          PYTHONPATH: ${{ github.workspace }}/hermes:${{ github.workspace }}/plugin
+        run: ${{ github.workspace }}/hermes/.venv/bin/python -m pytest -q tests

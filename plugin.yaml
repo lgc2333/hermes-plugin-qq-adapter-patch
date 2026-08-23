@@ -1,0 +1,30 @@
+name: qq-adapter-patch
+label: QQ Bot adapter patch (fork)
+kind: platform
+version: 1.1.0
+description: >
+  Drop-in fork of the built-in QQ Bot adapter with fixes and features on top
+  of upstream.  Current patches:
+  - Group-member allowlist: when QQ_GROUP_ALLOWED_MEMBERS (or
+    extra.group_member_allow_from) is set, only listed member_openid values
+    may trigger the bot inside an allowlisted group; rejected group messages
+    are logged with group/member ids to help discover member_openid values.
+  - Passive-reply quota fallback: on QQ's "被动回复时间或者次数超过限制" (per-message
+    reply quota exhausted), drop msg_id and retry once as an active message
+    instead of hammering the same msg_id with retries.
+  - Group → DM fallback when a group send fails (active-message permission
+    denied or passive-reply window expired).
+  Based on built-in gateway/platforms/qqbot/adapter.py v0.20.0.
+author: lgc2333
+requires_env:
+  - name: QQ_APP_ID
+    description: "QQ bot app id"
+    password: false
+  - name: QQ_CLIENT_SECRET
+    description: "QQ bot client secret"
+    password: true
+optional_env:
+  - name: QQ_GROUP_ALLOWED_MEMBERS
+    description: "Comma-separated member_openid values allowed inside allowlisted groups (empty = no per-member restriction)"
+    prompt: "Group member openids allowed (comma-separated, optional)"
+    password: false
