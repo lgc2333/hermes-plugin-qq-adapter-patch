@@ -2572,18 +2572,20 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
         last_result = SendResult(success=False, error="No chunks")
-        for chunk in chunks:
+        for chunk_index, chunk in enumerate(chunks):
             last_result = await self._send_chunk(chat_id, chunk, reply_to)
             if not last_result.success:
                 # Group send failed (active-message permission denied, passive
                 # reply window expired, etc.) — fall back to a private DM to
-                # the member tied to this response's trigger/session.  If that
-                # provenance is unavailable, _send_fallback_dm keeps the old
-                # group-last-sender fallback as a last resort.
+                # the member tied to this response's trigger/session.  Continue
+                # with every unsent chunk so long split responses are not
+                # clipped after the first fallback message.
                 if self._guess_chat_type(chat_id) == "group":
-                    dm_result = await self._send_fallback_dm(
+                    dm_result = await self._send_fallback_dm_chunks(
                         chat_id,
-                        chunk,
+                        chunks[chunk_index:],
+                        first_chunk_index=chunk_index,
+                        total_chunks=len(chunks),
                         member_openid=fallback_member_openid,
                         allow_legacy_fallback=allow_legacy_fallback,
                     )
@@ -2594,6 +2596,34 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
             reply_to = None
         return last_result
 
+    async def _send_fallback_dm_chunks(
+            self,
+            group_openid: str,
+            chunks: List[str],
+            *,
+            first_chunk_index: int,
+            total_chunks: int,
+            member_openid: Optional[str] = None,
+            allow_legacy_fallback: bool = False,
+    ) -> Optional[SendResult]:
+        """DM-fallback every unsent chunk after a group-send failure."""
+        last_result = SendResult(success=True)
+        for offset, chunk in enumerate(chunks):
+            dm_result = await self._send_fallback_dm(
+                group_openid,
+                chunk,
+                member_openid=member_openid,
+                allow_legacy_fallback=allow_legacy_fallback,
+                chunk_index=first_chunk_index + offset + 1,
+                total_chunks=total_chunks,
+            )
+            if dm_result is None:
+                return None
+            if not dm_result.success:
+                return dm_result
+            last_result = dm_result
+        return last_result
+
     async def _send_fallback_dm(
             self,
             group_openid: str,
@@ -2601,6 +2631,8 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
             *,
             member_openid: Optional[str] = None,
             allow_legacy_fallback: bool = False,
+            chunk_index: Optional[int] = None,
+            total_chunks: Optional[int] = None,
     ) -> Optional[SendResult]:
         """Send a failed group reply as a private DM.
 
@@ -2628,22 +2660,32 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
             else None
         )
         dm_text = f"[群消息发送失败，改由私聊回复]\n{content}"
+        chunk_label = (
+            f" chunk {chunk_index}/{total_chunks}"
+            if chunk_index is not None and total_chunks is not None
+            else ""
+        )
         logger.info(
-            "[%s] Falling back to DM for group %s → member %s (passive=%s)",
-            self._log_tag, group_openid, member_openid, bool(dm_reply_to),
+            "[%s] Falling back to DM%s for group %s → member %s (passive=%s)",
+            self._log_tag, chunk_label, group_openid, member_openid, bool(dm_reply_to),
         )
         try:
             result = await self._send_c2c_text(member_openid, dm_text, dm_reply_to)
-            if not result.success:
+            if result.success:
+                logger.info(
+                    "[%s] DM fallback%s delivered to %s (message_id=%s)",
+                    self._log_tag, chunk_label, member_openid, result.message_id,
+                )
+            else:
                 logger.warning(
-                    "[%s] DM fallback failed for %s: %s",
-                    self._log_tag, member_openid, result.error,
+                    "[%s] DM fallback%s failed for %s: %s",
+                    self._log_tag, chunk_label, member_openid, result.error,
                 )
             return result
         except Exception as exc:
             logger.warning(
-                "[%s] DM fallback raised for %s: %s",
-                self._log_tag, member_openid, exc,
+                "[%s] DM fallback%s raised for %s: %s",
+                self._log_tag, chunk_label, member_openid, exc,
             )
             return SendResult(success=False, error=str(exc), retryable=False)
 

@@ -366,6 +366,85 @@ async def test_group_send_failure_falls_back_to_metadata_member_not_last_sender(
     assert calls == [("MEMBER_OK", "C2C_MSG", "[群消息发送失败，改由私聊回复]\nreply")]
 
 
+async def test_group_send_failure_falls_back_all_unsent_chunks(adapter_instance):
+    adapter_instance._chat_type_map["GROUP"] = "group"
+    adapter_instance.truncate_message = lambda text, limit: ["part 1", "part 2", "part 3"]
+    group_calls = []
+    dm_calls = []
+
+    async def send_group(group_openid, content, reply_to=None, keyboard=None):
+        group_calls.append((group_openid, content, reply_to))
+        raise RuntimeError("forbidden")
+
+    async def send_c2c(openid, content, reply_to=None, keyboard=None):
+        dm_calls.append((openid, content, reply_to))
+        return SendResult(success=True, message_id=f"dm-{len(dm_calls)}")
+
+    adapter_instance._send_group_text = send_group
+    adapter_instance._send_c2c_text = send_c2c
+
+    result = await adapter_instance.send(
+        "GROUP",
+        "long reply",
+        metadata={
+            "source_chat_type": "group",
+            "source_chat_id": "GROUP",
+            "source_user_id": "MEMBER_OK",
+        },
+    )
+
+    assert result.success
+    assert result.message_id == "dm-3"
+    assert group_calls == [("GROUP", "part 1", None)]
+    assert dm_calls == [
+        ("MEMBER_OK", "[群消息发送失败，改由私聊回复]\npart 1", None),
+        ("MEMBER_OK", "[群消息发送失败，改由私聊回复]\npart 2", None),
+        ("MEMBER_OK", "[群消息发送失败，改由私聊回复]\npart 3", None),
+    ]
+
+
+async def test_group_send_later_chunk_failure_falls_back_remaining_only(adapter_instance):
+    adapter_instance._chat_type_map["GROUP"] = "group"
+    adapter_instance.truncate_message = lambda text, limit: ["part 1", "part 2", "part 3"]
+    group_calls = []
+    dm_calls = []
+
+    async def send_group(group_openid, content, reply_to=None, keyboard=None):
+        group_calls.append((group_openid, content, reply_to))
+        if content == "part 2":
+            raise RuntimeError("forbidden")
+        return SendResult(success=True, message_id=f"group-{len(group_calls)}")
+
+    async def send_c2c(openid, content, reply_to=None, keyboard=None):
+        dm_calls.append((openid, content, reply_to))
+        return SendResult(success=True, message_id=f"dm-{len(dm_calls)}")
+
+    adapter_instance._send_group_text = send_group
+    adapter_instance._send_c2c_text = send_c2c
+
+    result = await adapter_instance.send(
+        "GROUP",
+        "long reply",
+        reply_to="GROUP_MSG",
+        metadata={
+            "source_chat_type": "group",
+            "source_chat_id": "GROUP",
+            "source_user_id": "MEMBER_OK",
+        },
+    )
+
+    assert result.success
+    assert result.message_id == "dm-2"
+    assert group_calls == [
+        ("GROUP", "part 1", "GROUP_MSG"),
+        ("GROUP", "part 2", None),
+    ]
+    assert dm_calls == [
+        ("MEMBER_OK", "[群消息发送失败，改由私聊回复]\npart 2", None),
+        ("MEMBER_OK", "[群消息发送失败，改由私聊回复]\npart 3", None),
+    ]
+
+
 async def test_group_send_failure_uses_reply_anchor_member(adapter_instance):
     adapter_instance._chat_type_map["GROUP"] = "group"
     adapter_instance._group_last_sender["GROUP"] = "MEMBER_WRONG"
