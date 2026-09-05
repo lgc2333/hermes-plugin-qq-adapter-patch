@@ -6,7 +6,13 @@ This plugin registers platform `qqbot` and replaces Hermes' built-in QQ adapter 
 
 ## What is patched
 
-None yet.
+- ACL rejection logging at intake: rejected C2C / group / guild / guild-DM
+  messages are logged at INFO with the sender and chat openids, active policy,
+  reject reason and raw message content.
+- Group ACL config: env fallback `QQ_GROUP_ALLOW_FROM` for
+  `extra.group_allow_from`; new member-level filter for group messages via
+  `extra.group_member_allow_from` (env `QQ_GROUP_MEMBER_ALLOW_FROM`), enforced
+  after the group gate; unset list = any member.
 
 ## Compatibility
 
@@ -44,22 +50,32 @@ hermes plugins list --enabled
 
 4. Restart the gateway or the Hermes process that loads platforms.
 
-## Required configuration
+## Extra configuration
 
-Set QQ credentials in the active profile secret scope or environment:
+Group ACL in the QQ platform config (`platforms.qqbot.extra` in `config.yaml`):
 
-```text
-QQ_APP_ID
-QQ_CLIENT_SECRET
+```yaml
+group_policy: "allowlist"        # open | allowlist | disabled | pairing
+group_allow_from:                # group_openid allowlist (empty = reject all under allowlist)
+  - "group_openid_1"
+group_member_allow_from:         # optional member_openid filter inside allowed groups
+  - "member_openid_1"            # empty / absent = any member
 ```
 
-Optional group-member restriction:
+Env equivalents (used only when the corresponding `extra` key is absent):
 
 ```text
-QQ_GROUP_ALLOWED_MEMBERS=member_openid_1,member_openid_2
+QQ_GROUP_ALLOW_FROM=group_openid_1,group_openid_2
+QQ_GROUP_MEMBER_ALLOW_FROM=member_openid_1,member_openid_2
 ```
 
-Or configure `extra.group_member_allow_from` in the QQ platform config.
+Notes:
+
+- `group_policy` and `dm_policy` have no env spelling; set them in `config.yaml`.
+- `*` wildcards are honored in both allowlists.
+- Rejected messages are logged at INFO with the group/member openid, reason
+  (`group_not_in_allowlist` / `member_not_in_allowlist` / ...), policy and raw
+  content — use the log to discover openids for your allowlist.
 
 ## Tests
 

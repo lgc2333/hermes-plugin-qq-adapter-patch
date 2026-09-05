@@ -241,9 +241,21 @@ class QQAdapter(BasePlatformAdapter):
             extra.get("allow_from") or extra.get("allowFrom")
         )
         self._group_policy = str(extra.get("group_policy", "pairing")).strip().lower()
-        self._group_allow_from = _coerce_list(
+        group_allow = _coerce_list(
             extra.get("group_allow_from") or extra.get("groupAllowFrom")
         )
+        if not group_allow:
+            group_allow = _coerce_list(_resolve_qq_secret("QQ_GROUP_ALLOW_FROM", ""))
+        self._group_allow_from = group_allow
+        group_members = _coerce_list(
+            extra.get("group_member_allow_from")
+            or extra.get("groupMemberAllowFrom")
+        )
+        if not group_members:
+            group_members = _coerce_list(
+                _resolve_qq_secret("QQ_GROUP_MEMBER_ALLOW_FROM", "")
+            )
+        self._group_member_allow_from = group_members
 
         # Connection state
         self._session: Optional[aiohttp.ClientSession] = None
@@ -1254,6 +1266,10 @@ class QQAdapter(BasePlatformAdapter):
         if not user_openid:
             return
         if not self._is_dm_intake_allowed(user_openid):
+            logger.info(
+                "[%s] C2C message rejected by ACL: user=%s policy=%s content=%r",
+                self._log_tag, user_openid, self._dm_policy, content,
+            )
             return
 
         text = content
@@ -1348,9 +1364,14 @@ class QQAdapter(BasePlatformAdapter):
         group_openid = str(d.get("group_openid", ""))
         if not group_openid:
             return
-        if not self._is_group_allowed(
-                group_openid, str(author.get("member_openid", ""))
-        ):
+        member_openid = str(author.get("member_openid", ""))
+        reason = self._group_acl_reject_reason(group_openid, member_openid)
+        if reason:
+            logger.info(
+                "[%s] Group message rejected by ACL: group=%s member=%s reason=%s policy=%s content=%r",
+                self._log_tag, group_openid, member_openid, reason,
+                self._group_policy, content,
+            )
             return
 
         # Strip the @bot mention prefix from content
@@ -1419,10 +1440,13 @@ class QQAdapter(BasePlatformAdapter):
         # bypass the configured allowlist.
         guild_id = str(d.get("guild_id", ""))
         author_id = str(author.get("id", ""))
-        if not self._is_group_allowed(guild_id or channel_id, author_id):
-            logger.debug(
-                "[%s] Guild message blocked by ACL: channel=%s user=%s",
-                self._log_tag, channel_id, author_id,
+        if not self._is_group_allowed(
+            guild_id or channel_id, author_id, check_member=False
+        ):
+            logger.info(
+                "[%s] Guild message rejected by ACL: guild=%s channel=%s user=%s policy=%s content=%r",
+                self._log_tag, guild_id, channel_id, author_id,
+                self._group_policy, content,
             )
             return
 
@@ -1494,9 +1518,9 @@ class QQAdapter(BasePlatformAdapter):
         # bypass the configured allowlist via direct messages.
         author_id = str(author.get("id", ""))
         if not self._is_dm_intake_allowed(author_id):
-            logger.debug(
-                "[%s] Guild DM blocked by ACL: guild=%s user=%s",
-                self._log_tag, guild_id, author_id,
+            logger.info(
+                "[%s] Guild DM rejected by ACL: guild=%s user=%s policy=%s content=%r",
+                self._log_tag, guild_id, author_id, self._dm_policy, content,
             )
             return
 
@@ -3224,16 +3248,36 @@ class QQAdapter(BasePlatformAdapter):
             return self._open_dm_opted_in()
         return False
 
-    def _is_group_allowed(self, group_id: str, user_id: str) -> bool:
-        if self._group_policy == "disabled":
-            return False
-        if self._group_policy == "allowlist":
-            return self._entry_matches(self._group_allow_from, group_id)
-        if self._group_policy == "pairing":
-            return False
-        if self._group_policy == "open":
-            return True
-        return False
+    def _group_acl_reject_reason(
+        self, group_id: str, user_id: str, *, check_member: bool = True
+    ) -> Optional[str]:
+        """Return why a group-context message is rejected, or None if allowed."""
+        policy = self._group_policy
+        if policy == "disabled":
+            return "policy_disabled"
+        if policy == "pairing":
+            return "policy_pairing"
+        if policy == "allowlist" and not self._entry_matches(
+            self._group_allow_from, group_id
+        ):
+            return "group_not_in_allowlist"
+        if (
+            check_member
+            and self._group_member_allow_from
+            and not self._entry_matches(self._group_member_allow_from, user_id)
+        ):
+            return "member_not_in_allowlist"
+        if policy in {"allowlist", "open"}:
+            return None
+        return f"unknown_policy:{policy}"
+
+    def _is_group_allowed(
+        self, group_id: str, user_id: str, *, check_member: bool = True
+    ) -> bool:
+        return (
+            self._group_acl_reject_reason(group_id, user_id, check_member=check_member)
+            is None
+        )
 
     @staticmethod
     def _entry_matches(entries: List[str], target: str) -> bool:

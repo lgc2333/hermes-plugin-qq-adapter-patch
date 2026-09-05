@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from gateway.config import Platform
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ADAPTER_PATH = REPO_ROOT / "adapter.py"
@@ -28,7 +30,9 @@ def adapter_module():
 
 @pytest.fixture()
 def adapter_instance(adapter_module):
-    adapter = object.__new__(adapter_module.QQAdapterPatchAdapter)
+    adapter = object.__new__(adapter_module.QQAdapter)
+    adapter.platform = Platform.QQBOT
+    adapter._message_handler = None
     adapter._app_id = "test-app"
     adapter._chat_type_map = {}
     adapter._group_last_sender = {}
