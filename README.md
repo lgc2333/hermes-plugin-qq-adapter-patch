@@ -1,0 +1,84 @@
+# Hermes QQ Adapter Patch
+
+Hermes directory plugin for the official QQ Bot adapter.
+
+This plugin registers platform `qqbot` and replaces Hermes' built-in QQ adapter at runtime. It carries local fixes for QQ group/private delivery behavior.
+
+## What is patched
+
+None yet.
+
+## Compatibility
+
+This is not a standalone Python app. It depends on Hermes runtime modules such as `gateway.*` and `gateway.platforms.qqbot.*`.
+
+Tested against the local Hermes source layout where QQ adapter support is available under:
+
+```text
+gateway/platforms/qqbot/
+```
+
+## Install
+
+Use the active profile's `HERMES_HOME`. Do not hardcode `~/.hermes`.
+
+1. Copy the directory plugin:
+
+```bash
+mkdir -p "$HERMES_HOME/plugins"
+cp -R qq-adapter-patch "$HERMES_HOME/plugins/qq-adapter-patch"
+```
+
+2. Enable it:
+
+```bash
+hermes plugins enable qq-adapter-patch
+```
+
+3. Check it:
+
+```bash
+hermes plugins doctor "$HERMES_HOME/plugins/qq-adapter-patch"
+hermes plugins list --enabled
+```
+
+4. Restart the gateway or the Hermes process that loads platforms.
+
+## Required configuration
+
+Set QQ credentials in the active profile secret scope or environment:
+
+```text
+QQ_APP_ID
+QQ_CLIENT_SECRET
+```
+
+Optional group-member restriction:
+
+```text
+QQ_GROUP_ALLOWED_MEMBERS=member_openid_1,member_openid_2
+```
+
+Or configure `extra.group_member_allow_from` in the QQ platform config.
+
+## Tests
+
+From this repo, with Hermes source available at `/opt/hermes`:
+
+```bash
+PYTHONPATH=/opt/hermes /opt/hermes/.venv/bin/python -m pytest -q tests
+```
+
+The GitHub Actions workflow checks out Hermes, installs its dev + messaging dependencies, runs an upstream QQ adapter import smoke test, verifies this directory plugin with `hermes plugins doctor`, overlays `adapter.py` onto Hermes' `gateway/platforms/qqbot/adapter.py`, then runs the upstream QQ-related tests:
+
+```text
+tests/gateway/test_qqbot.py
+tests/gateway/test_qqbot_credential_isolation.py
+tests/gateway/test_qqbot_scope_paths.py
+```
+
+Finally, it runs this plugin's own regression tests.
+
+## Notes
+
+Default tests are mock-only. They do not connect to QQ, do not use real credentials, and do not send real messages.

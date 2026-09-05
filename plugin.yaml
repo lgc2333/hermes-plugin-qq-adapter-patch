@@ -1,0 +1,15 @@
+name: qq-adapter-patch
+label: QQ Bot adapter patch (fork)
+kind: platform
+version: 1.1.0
+description: >
+  Drop-in fork of the built-in QQ Bot adapter with fixes and features on top
+  of upstream.
+author: lgc2333
+requires_env:
+  - name: QQ_APP_ID
+    description: "QQ bot app id"
+    password: false
+  - name: QQ_CLIENT_SECRET
+    description: "QQ bot client secret"
+    password: true
