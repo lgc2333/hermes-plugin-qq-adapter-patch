@@ -712,3 +712,267 @@ async def test_media_quota_fallback_removes_msg_id_and_changes_msg_seq(adapter_i
     assert api_calls[0][2]["msg_id"] == "MSG1"
     assert "msg_id" not in api_calls[1][2]
     assert api_calls[0][2]["msg_seq"] != api_calls[1][2]["msg_seq"]
+
+
+# ---------------------------------------------------------------------------
+# Group send gate (@[ ] prefix restriction)
+# ---------------------------------------------------------------------------
+
+def _gate_adapter(adapter_instance, enabled=True, chat_type="group"):
+    adapter_instance._group_send_gate = enabled
+    if chat_type:
+        adapter_instance._chat_type_map["GROUP"] = chat_type
+    return adapter_instance
+
+
+async def test_group_send_gate_blocks_unprefixed_group_text(adapter_instance):
+    _gate_adapter(adapter_instance)
+    sent = []
+
+    async def send_group(group_openid, content, reply_to=None, keyboard=None):
+        sent.append(content)
+        return SendResult(success=True, message_id="ok")
+
+    adapter_instance._send_group_text = send_group
+
+    result = await adapter_instance.send("GROUP", "hello")
+
+    assert not result.success
+    assert result.retryable is False
+    assert "group send gate" in (result.error or "")
+    assert sent == []
+
+
+async def test_group_send_gate_allows_prefixed_group_text(adapter_instance):
+    _gate_adapter(adapter_instance)
+    sent = []
+
+    async def send_group(group_openid, content, reply_to=None, keyboard=None):
+        sent.append(content)
+        return SendResult(success=True, message_id="ok")
+
+    adapter_instance._send_group_text = send_group
+
+    result = await adapter_instance.send("GROUP", "[@] hello")
+
+    assert result.success
+    assert sent == ["[@] hello"]
+
+
+async def test_group_send_gate_prefix_checked_on_full_message_not_chunks(
+    adapter_instance,
+):
+    _gate_adapter(adapter_instance)
+    sent = []
+
+    async def send_group(group_openid, content, reply_to=None, keyboard=None):
+        sent.append(content)
+        return SendResult(success=True, message_id="ok")
+
+    adapter_instance._send_group_text = send_group
+    long_body = "x" * 60
+    adapter_instance.truncate_message = lambda text, limit: [
+        text[i : i + 20] for i in range(0, len(text), 20)
+    ]
+
+    result = await adapter_instance.send("GROUP", f"[@] {long_body}")
+
+    assert result.success
+    assert len(sent) == 4
+    assert sent[0].startswith("[@] ")
+    # Continuation chunks carry the split body only — the gate check ran on
+    # the full message once, before chunking.
+    assert not sent[1].startswith("[@]")
+
+
+async def test_group_send_gate_disabled_sends_unprefixed(adapter_instance):
+    _gate_adapter(adapter_instance, enabled=False)
+    sent = []
+
+    async def send_group(group_openid, content, reply_to=None, keyboard=None):
+        sent.append(content)
+        return SendResult(success=True, message_id="ok")
+
+    adapter_instance._send_group_text = send_group
+
+    result = await adapter_instance.send("GROUP", "hello")
+
+    assert result.success
+    assert sent == ["hello"]
+
+
+async def test_group_send_gate_does_not_apply_to_c2c(adapter_instance):
+    _gate_adapter(adapter_instance, chat_type="c2c")
+    sent = []
+
+    async def send_c2c(openid, content, reply_to=None, keyboard=None):
+        sent.append(content)
+        return SendResult(success=True, message_id="ok")
+
+    adapter_instance._send_c2c_text = send_c2c
+
+    result = await adapter_instance.send("GROUP", "hello")
+
+    assert result.success
+    assert sent == ["hello"]
+
+
+async def test_group_send_gate_media_caption_blocked_without_prefix(
+    adapter_instance,
+):
+    _gate_adapter(adapter_instance)
+    adapter_instance._upload_media = AsyncMock(
+        return_value={"file_info": "FILE_INFO"}
+    )
+    adapter_instance._api_request = AsyncMock(return_value={"id": "media"})
+
+    result = await adapter_instance._send_media(
+        "GROUP",
+        "https://example.com/image.png",
+        file_type=1,
+        kind="image",
+        caption="no prefix",
+        reply_to="MSG1",
+    )
+
+    assert not result.success
+    assert result.retryable is False
+    assert "group send gate" in (result.error or "")
+    adapter_instance._api_request.assert_not_called()
+
+
+async def test_group_send_gate_media_caption_blocked_when_missing(adapter_instance):
+    _gate_adapter(adapter_instance)
+    adapter_instance._upload_media = AsyncMock(
+        return_value={"file_info": "FILE_INFO"}
+    )
+    adapter_instance._api_request = AsyncMock(return_value={"id": "media"})
+
+    result = await adapter_instance._send_media(
+        "GROUP",
+        "https://example.com/image.png",
+        file_type=1,
+        kind="image",
+        caption=None,
+        reply_to="MSG1",
+    )
+
+    assert not result.success
+    adapter_instance._api_request.assert_not_called()
+
+
+async def test_group_send_gate_media_allows_prefixed_caption(adapter_instance):
+    _gate_adapter(adapter_instance)
+    adapter_instance._upload_media = AsyncMock(
+        return_value={"file_info": "FILE_INFO"}
+    )
+    adapter_instance._api_request = AsyncMock(return_value={"id": "media"})
+
+    result = await adapter_instance._send_media(
+        "GROUP",
+        "https://example.com/image.png",
+        file_type=1,
+        kind="image",
+        caption="[@] look",
+        reply_to="MSG1",
+    )
+
+    assert result.success
+    adapter_instance._api_request.assert_called_once()
+
+
+async def test_group_send_gate_config_and_env_resolution(adapter_module, monkeypatch):
+    adapter = adapter_module.QQAdapterPatchAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "app_id": "a",
+                "client_secret": "b",
+                "group_send_gate": True,
+            },
+        )
+    )
+    assert adapter._group_send_gate is True
+
+    env_only = adapter_module.QQAdapterPatchAdapter(
+        PlatformConfig(enabled=True, extra={"app_id": "a", "client_secret": "b"})
+    )
+    assert env_only._group_send_gate is False
+
+    monkeypatch.setenv("QQ_GROUP_SEND_GATE", "true")
+    env_only = adapter_module.QQAdapterPatchAdapter(
+        PlatformConfig(enabled=True, extra={"app_id": "a", "client_secret": "b"})
+    )
+    assert env_only._group_send_gate is True
+
+    monkeypatch.delenv("QQ_GROUP_SEND_GATE")
+    off = adapter_module.QQAdapterPatchAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"app_id": "a", "client_secret": "b", "group_send_gate": False},
+        )
+    )
+    assert off._group_send_gate is False
+
+
+async def test_group_send_gate_prompt_note_appended_for_qqbot_group(
+    adapter_module, adapter_instance, monkeypatch
+):
+    ctx_mod = adapter_module
+    monkeypatch.setattr(
+        ctx_mod, "_original_build_session_context_prompt",
+        lambda context, *, redact_pii=False: "## Current Session Context\nbody",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ctx_mod, "_group_send_gate_enabled_from_config", lambda: True,
+        raising=False,
+    )
+
+    class FakeSource:
+        platform = None
+        chat_type = "group"
+
+    class FakeContext:
+        source = FakeSource()
+
+    from gateway.config import Platform
+
+    FakeSource.platform = Platform.QQBOT
+
+    rendered = ctx_mod._render_session_context_prompt_with_gate(
+        FakeContext(), redact_pii=False
+    )
+    assert rendered.startswith("## Current Session Context")
+    assert "Group send gate:" in rendered
+    assert "[@]" in rendered
+
+
+async def test_group_send_gate_prompt_note_absent_for_dm(adapter_module, monkeypatch):
+    ctx_mod = adapter_module
+    monkeypatch.setattr(
+        ctx_mod, "_original_build_session_context_prompt",
+        lambda context, *, redact_pii=False: "## Current Session Context\nbody",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ctx_mod, "_group_send_gate_enabled_from_config", lambda: True,
+        raising=False,
+    )
+
+    class FakeSource:
+        platform = None
+        chat_type = "dm"
+
+    class FakeContext:
+        source = FakeSource()
+
+    from gateway.config import Platform
+
+    FakeSource.platform = Platform.QQBOT
+
+    rendered = ctx_mod._render_session_context_prompt_with_gate(
+        FakeContext(), redact_pii=False
+    )
+    assert rendered == "## Current Session Context\nbody"
+

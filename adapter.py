@@ -148,6 +148,13 @@ def _coerce_list(value: Any) -> List[str]:
     return _coerce_list_impl(value)
 
 
+def _coerce_bool(value: Any) -> bool:
+    """Coerce a config/env value into a bool (truthy strings allowed)."""
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"true", "1", "yes", "on"}
+
+
 def _resolve_qq_secret(name: str, default: str = "") -> str:
     """Resolve a per-profile ``QQ_*`` setting honoring the active secret scope.
 
@@ -188,12 +195,19 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
     - passive-reply quota fallback: on QQ's per-message reply-quota
       exhaustion (``被动回复时间或者次数超过限制``), drop msg_id and retry
       once as an active message instead of retrying the same msg_id;
-    - group → DM fallback when a group send fails.
+    - group → DM fallback when a group send fails;
+    - group send gate: when ``group_send_gate`` is enabled, only messages
+      starting with the literal ``[@]`` prefix are sent to group chats
+      (text and media; approval/update keyboards are exempt).
     """
 
     # QQ Bot API does not support editing sent messages.
     SUPPORTS_MESSAGE_EDITING = False
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+    # Literal prefix required by the group send gate (see ``__init__``).
+    GROUP_SEND_PREFIX = "[@]"
+    # Default off; instance value set in __init__ from extra/env.
+    _group_send_gate = False
     _TYPING_INPUT_SECONDS = 60  # input_notify duration reported to QQ
     _TYPING_DEBOUNCE_SECONDS = 50  # refresh before it expires
 
@@ -263,6 +277,16 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
             group_member_allow_value = _resolve_qq_secret("QQ_GROUP_ALLOWED_MEMBERS", "")
         self._group_member_allow_from = _coerce_list(group_member_allow_value)
 
+        # Group send gate: when enabled, only content starting with the
+        # literal "[@]" prefix may be sent to a group chat (text + media
+        # captions; approval/update keyboards stay exempt). Mirrors the
+        # allowlist pattern: config ``extra.group_send_gate`` first, env
+        # ``QQ_GROUP_SEND_GATE`` as fallback.
+        gate_value = extra.get("group_send_gate")
+        if gate_value is None:
+            gate_value = _resolve_qq_secret("QQ_GROUP_SEND_GATE", "")
+        self._group_send_gate = _coerce_bool(gate_value)
+
         # Connection state
         self._session: Optional[aiohttp.ClientSession] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
@@ -295,6 +319,26 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
         self._group_msg_sender: Dict[str, Tuple[str, str, float]] = {}
         self._group_msg_sender_ttl = 24 * 60 * 60
         self._group_msg_sender_max = 1000
+        # Last-resort DM fallback: per-group recent inbound speakers with
+        # timestamps.  When a group send fails and no response-specific
+        # provenance (metadata / reply anchor / delivery ledger) resolves a
+        # member, exactly-one-recent-speaker lets us DM them instead of
+        # silently dropping the message.  See _remember_recent_group_sender.
+        self._group_recent_senders: Dict[str, Dict[str, float]] = {}
+        # Deliberately decoupled from QQ's 5-minute passive-reply window:
+        # fallback DMs are active messages and need no msg_id, so the window
+        # is a conversation-staleness bound instead.  A 5-minute bound would
+        # re-drop messages in any task outlasting 5 minutes — the 2026-09-05
+        # incident itself ran ~10 minutes.
+        window_value = extra.get("group_dm_fallback_window")
+        if window_value is None:
+            window_value = _resolve_qq_secret("QQ_GROUP_DM_FALLBACK_WINDOW", "")
+        try:
+            self._group_recent_sender_window = float(window_value)
+        except (TypeError, ValueError):
+            self._group_recent_sender_window = 0.0
+        if self._group_recent_sender_window <= 0:
+            self._group_recent_sender_window = 7200.0  # default: 2 hours
         # Typing debounce: chat_id → last send_typing timestamp
         self._typing_sent_at: Dict[str, float] = {}
 
@@ -1432,6 +1476,7 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
         if member_openid:
             self._group_last_sender[group_openid] = member_openid
             self._remember_group_msg_sender(msg_id, group_openid, member_openid)
+            self._remember_recent_group_sender(group_openid, member_openid)
         event = MessageEvent(
             source=self.build_source(
                 chat_id=group_openid,
@@ -2560,6 +2605,16 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
             if fallback_member_openid:
                 self._chat_type_map[chat_id] = "group"
                 allow_legacy_fallback = False
+        if fallback_member_openid is None and known_chat_type != "c2c":
+            # Last resort (2026-09-05 missed-message incident): intermediate
+            # progress messages carry no metadata and write no delivery-ledger
+            # row, and the group msg_id anchor expires with QQ's 5-minute
+            # passive-reply window.  When a group send then fails, the message
+            # used to be silently dropped ("no known sender").  If exactly one
+            # member has spoken in this group recently, DM them instead.
+            # Two or more recent speakers → stay silent (a wrong-recipient DM
+            # leaks one user's reply to another).
+            fallback_member_openid = self._sole_recent_group_sender(chat_id)
 
         if not self.is_connected:
             if not await self._wait_for_reconnection():
@@ -2567,6 +2622,16 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
 
         if not content or not content.strip():
             return SendResult(success=True)
+
+        if self._group_send_gate_blocked_group_send(chat_id, content):
+            return SendResult(
+                success=False,
+                error=(
+                    f"group send gate: content must start with "
+                    f"{self.GROUP_SEND_PREFIX!r} to be sent to a group chat"
+                ),
+                retryable=False,
+            )
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
@@ -2595,6 +2660,23 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
             # Only reply_to the first chunk
             reply_to = None
         return last_result
+
+    def _group_send_gate_blocked_group_send(
+            self, chat_id: str, content: Optional[str]
+    ) -> bool:
+        """True when the group send gate blocks this outbound content.
+
+        Applies only to group chats (``chat_type=group``) while
+        ``extra.group_send_gate`` (or ``QQ_GROUP_SEND_GATE``) is enabled:
+        content must start with the literal ``[@]`` prefix. Guild channels,
+        C2C chats, and the gate-disabled state are always allowed through.
+        """
+        if not self._group_send_gate:
+            return False
+        if self._guess_chat_type(chat_id) != "group":
+            return False
+        text = content or ""
+        return not text.lstrip().startswith(self.GROUP_SEND_PREFIX)
 
     async def _send_fallback_dm_chunks(
             self,
@@ -3201,6 +3283,16 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
             if last_msg_id and (time.time() - last_ts) <= 300.0:
                 reply_to = last_msg_id
 
+        if self._group_send_gate_blocked_group_send(chat_id, caption):
+            return SendResult(
+                success=False,
+                error=(
+                    f"group send gate: media caption must start with "
+                    f"{self.GROUP_SEND_PREFIX!r} to be sent to a group chat"
+                ),
+                retryable=False,
+            )
+
         if chat_type == "guild":
             # Guild channels don't support native media upload in the same way.
             return SendResult(
@@ -3309,6 +3401,30 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.error("[%s] Media send failed: %s", self._log_tag, exc)
+            # 2026-09-05 missed-image incident: a failed group media send used
+            # to just return the error — no DM fallback, so generated images
+            # were silently lost on QQ's 主动消息 rate limit.  DM the same
+            # member the text path would pick (sole recent group speaker).
+            # The media is re-sent as caption + local-path text: a native
+            # media DM would need a fresh C2C upload that QQ may also
+            # throttle, while the text form still delivers the file location.
+            # _send_media receives no provenance metadata, so member
+            # resolution here is the sole-recent-speaker last resort.
+            if self._guess_chat_type(chat_id) == "group":
+                fallback_member = self._sole_recent_group_sender(chat_id)
+                if fallback_member:
+                    try:
+                        return await self._send_fallback_dm(
+                            chat_id,
+                            f"{caption or kind}\n[原始文件] {media_source}",
+                            member_openid=fallback_member,
+                            allow_legacy_fallback=False,
+                        )
+                    except Exception as dm_exc:
+                        logger.error(
+                            "[%s] Media DM fallback failed for %s: %s",
+                            self._log_tag, chat_id, dm_exc,
+                        )
             return SendResult(success=False, error=str(exc))
 
     async def _upload_local_file(
@@ -3493,6 +3609,48 @@ class QQAdapterPatchAdapter(BasePlatformAdapter):
         self._group_msg_sender[msg_id] = (group_openid, member_openid, now)
         if len(self._group_msg_sender) > self._group_msg_sender_max:
             self._prune_group_msg_sender(now)
+
+    def _remember_recent_group_sender(
+            self, group_openid: str, member_openid: str,
+    ) -> None:
+        """Record an inbound group speaker for the last-resort DM fallback.
+
+        Kept per-group with timestamps so ``_sole_recent_group_sender`` can
+        tell whether a failed group response has exactly one plausible
+        recipient.  Entries age out after ``_group_recent_sender_window``
+        seconds — a conversation-staleness bound, deliberately NOT QQ's
+        5-minute passive-reply window (fallback DMs are active messages and
+        need no msg_id; the incident task itself outlived 5 minutes).
+        """
+        group_openid = str(group_openid or "").strip()
+        member_openid = str(member_openid or "").strip()
+        if not group_openid or not member_openid:
+            return
+        now = time.time()
+        senders = self._group_recent_senders.setdefault(group_openid, {})
+        senders[member_openid] = now
+        # Bound the per-group map: drop stale entries and cap the size.
+        stale = [
+            member for member, ts in senders.items()
+            if (now - ts) > self._group_recent_sender_window
+        ]
+        for member in stale:
+            senders.pop(member, None)
+        if len(senders) > 16:
+            keep = sorted(senders.items(), key=lambda kv: kv[1], reverse=True)[:16]
+            self._group_recent_senders[group_openid] = dict(keep)
+
+    def _sole_recent_group_sender(self, group_openid: str) -> Optional[str]:
+        """Return the only recent group speaker, or None if 0 or ≥2 of them."""
+        senders = self._group_recent_senders.get(group_openid) or {}
+        now = time.time()
+        recent = [
+            member for member, ts in senders.items()
+            if (now - ts) <= self._group_recent_sender_window
+        ]
+        if len(recent) == 1:
+            return recent[0]
+        return None
 
     def _prune_group_msg_sender(self, now: Optional[float] = None) -> None:
         now = now if now is not None else time.time()
@@ -3759,6 +3917,112 @@ QQAdapter = QQAdapterPatchAdapter
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Group send gate — system prompt note
+# ---------------------------------------------------------------------------
+
+_GROUP_SEND_GATE_NOTE = (
+    "**Group send gate:** Replies to this QQ group must start with `[@]` "
+    "or they are silently dropped."
+)
+
+# Set by _install_session_context_prompt_patch(); None until installed.
+_original_build_session_context_prompt = None
+
+
+def _group_send_gate_enabled_from_config() -> bool:
+    """Resolve the gate flag the same way the adapter does: config extra
+    first (``gateway.platforms.qqbot.extra`` merged with top-level
+    ``platforms.qqbot.extra``, leaf wins), env ``QQ_GROUP_SEND_GATE`` as
+    fallback. Read-only; any failure disables the note (fail open — the
+    send-side gate itself keeps enforcing).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+        _gw = ((cfg.get("gateway") or {}).get("platforms") or {}).get("qqbot") or {}
+        _top = (cfg.get("platforms") or {}).get("qqbot") or {}
+        gw_extra = _gw.get("extra") if isinstance(_gw, dict) else None
+        top_extra = _top.get("extra") if isinstance(_top, dict) else None
+        merged = {
+            **(gw_extra if isinstance(gw_extra, dict) else {}),
+            **(top_extra if isinstance(top_extra, dict) else {}),
+        }
+        value = merged.get("group_send_gate")
+        if value is None:
+            value = os.getenv("QQ_GROUP_SEND_GATE", "")
+        return _coerce_bool(value)
+    except Exception:
+        return False
+
+
+def _render_session_context_prompt_with_gate(context, *, redact_pii=False):
+    """Append the group send gate note to the per-session
+    "## Current Session Context" prompt for qqbot group chats while the
+    gate is enabled. Frozen with the session's system prompt render —
+    not a per-turn channel_prompt injection.
+    """
+    prompt = _original_build_session_context_prompt(context, redact_pii=redact_pii)
+    try:
+        from gateway.config import Platform
+
+        source = getattr(context, "source", None)
+        if (
+            prompt is not None
+            and source is not None
+            and getattr(source, "platform", None) == Platform.QQBOT
+            and getattr(source, "chat_type", "") == "group"
+            and _group_send_gate_enabled_from_config()
+        ):
+            prompt = prompt.rstrip("\n") + "\n\n" + _GROUP_SEND_GATE_NOTE
+    except Exception:
+        pass
+    return prompt
+
+
+def _install_session_context_prompt_patch() -> None:
+    """Rebind ``build_session_context_prompt`` so the gate note rides the
+    session context prompt.
+
+    ``gateway.run`` imported the original at module load time (before
+    plugins register), so both the defining module and any already-imported
+    holders must be rebound; later importers pick up the patched attribute
+    from ``gateway.session`` directly.
+    """
+    global _original_build_session_context_prompt
+    if _original_build_session_context_prompt is not None:
+        return
+    try:
+        import sys
+
+        session_mod = sys.modules.get("gateway.session")
+        if session_mod is None:
+            import gateway.session as session_mod
+        original = getattr(session_mod, "build_session_context_prompt", None)
+        if original is None or getattr(original, "_qq_group_send_gate_patch", False):
+            return
+        _original_build_session_context_prompt = original
+
+        def _patched(context, *, redact_pii=False):
+            return _render_session_context_prompt_with_gate(
+                context, redact_pii=redact_pii
+            )
+
+        _patched._qq_group_send_gate_patch = True
+        session_mod.build_session_context_prompt = _patched
+        for mod_name in ("gateway.run", "gateway"):
+            mod = sys.modules.get(mod_name)
+            if mod is not None and getattr(
+                mod, "build_session_context_prompt", None
+            ) is original:
+                mod.build_session_context_prompt = _patched
+    except Exception as exc:
+        logger.warning(
+            "group send gate: could not patch build_session_context_prompt: %s", exc
+        )
+
+
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system at startup.
 
@@ -3766,6 +4030,7 @@ def register(ctx) -> None:
     ``_create_adapter()`` (which checks plugin-registered platforms first)
     uses this fork instead of the built-in ``QQAdapter``.
     """
+    _install_session_context_prompt_patch()
     ctx.register_platform(
         name="qqbot",
         label="QQ Bot adapter patch (fork)",

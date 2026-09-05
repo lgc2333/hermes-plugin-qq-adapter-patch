@@ -35,6 +35,8 @@ def adapter_instance(adapter_module):
     adapter._group_msg_sender = {}
     adapter._group_msg_sender_ttl = 86400
     adapter._group_msg_sender_max = 1000
+    adapter._group_recent_senders = {}
+    adapter._group_recent_sender_window = 7200.0
     adapter._last_msg_id = {}
     adapter._last_msg_id_ts = {}
     adapter._running = True

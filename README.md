@@ -11,6 +11,7 @@ This plugin registers platform `qqbot` and replaces Hermes' built-in QQ adapter 
 - Group-to-DM fallback when group send fails.
 - P0 regression fix: a private C2C chat must not be polluted as a group chat by delivery ledger lookup.
 - Metadata guard: group provenance is used only when `source_chat_id` matches the current target chat.
+- Group send gate via `extra.group_send_gate` (or env `QQ_GROUP_SEND_GATE`): when enabled, only messages whose content starts with the literal `[@]` prefix are sent to group chats (text and media captions; approval/update keyboards are exempt). A one-line note is appended to the session context prompt so the model knows the rule.
 
 ## Compatibility
 
