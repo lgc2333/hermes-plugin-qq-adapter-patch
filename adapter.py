@@ -151,6 +151,20 @@ _REPLY_ANCHOR_DEAD_MARKERS = (
     "msg_id 无效",
 )
 
+# QQ returns this when the chat id does not exist on the endpoint we chose —
+# in practice a group openid sent to /v2/users (or the reverse), which happens
+# when the chat kind was guessed instead of known (fresh process after a
+# gateway restart, ledger redelivery of a queued message). The cure is to flip
+# the endpoint once, not to retry the same one.
+_ENDPOINT_WRONG_CODES = frozenset({
+    40011028,  # 请求的资源不存在(用户/群已注销)
+})
+
+_ENDPOINT_WRONG_MARKERS = (
+    "资源不存在",
+    "用户/群已注销",
+)
+
 
 # ---------------------------------------------------------------------------
 # Constants — imported from the shared constants module.
@@ -439,6 +453,10 @@ class QQAdapter(BasePlatformAdapter):
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             self._mark_connected()
             logger.info("[%s] Connected", self._log_tag)
+            # A fresh process starts with an empty chat-type map; learn the
+            # kinds the gateway already knows so queued / redelivered sends hit
+            # the right endpoint instead of being guessed as c2c.
+            self._seed_chat_types_from_routing()
             # Plugin-registered native handlers (ctx.register_platform_handler).
             self._wire_plugin_handlers(None)
             return True
@@ -2635,6 +2653,33 @@ class QQAdapter(BasePlatformAdapter):
         text = str(exc).lower()
         return any(marker in text for marker in _REPLY_ANCHOR_DEAD_MARKERS)
 
+    @staticmethod
+    def _is_wrong_endpoint(exc: BaseException) -> bool:
+        """True when QQ does not know the chat id on the endpoint we used.
+
+        Covers the guess-wrong-chat-kind case (a group id sent to ``/v2/users``
+        or the reverse); the caller flips the endpoint once instead of retrying.
+        """
+        if getattr(exc, "err_code", None) in _ENDPOINT_WRONG_CODES:
+            return True
+        text = str(exc)
+        return any(marker in text for marker in _ENDPOINT_WRONG_MARKERS)
+
+    @staticmethod
+    def _flip_chat_type(chat_type: str) -> Optional[str]:
+        """The other endpoint for ``chat_type``; None when there is no other."""
+        return {"c2c": "group", "group": "c2c"}.get(str(chat_type or ""))
+
+    @staticmethod
+    def _normalize_chat_type(chat_type: str) -> Optional[str]:
+        """Map a session-key chat kind onto this adapter's chat types.
+
+        Session keys use ``dm`` for a private chat (``build_source``); sends
+        route on ``c2c``. Guild channels and guild DMs keep their own kinds.
+        """
+        normalized = {"dm": "c2c", "c2c": "c2c", "group": "group", "guild": "guild"}
+        return normalized.get(str(chat_type or "").strip().lower())
+
     async def _dispatch_text_chunk(
             self,
             chat_type: str,
@@ -2661,13 +2706,16 @@ class QQAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a single chunk with retry + exponential backoff.
 
-        A dead passive anchor (expired ``msg_id``, exhausted passive quota) is
-        never retried as-is: the chunk is resent once as an ACTIVE message
-        (``reply_to`` dropped), because the same anchor can only fail again.
+        Two one-shot recoveries run before the generic backoff: a dead passive
+        anchor (expired ``msg_id``, exhausted passive quota) is dropped and the
+        chunk resent as an ACTIVE message, and a wrong endpoint (chat id unknown
+        on this one) flips ``c2c``/``group`` once. Neither failure is retried
+        as-is — repeating them can never succeed.
         """
         last_exc: Optional[Exception] = None
         chat_type = self._guess_chat_type(chat_id)
         anchor_fallback_done = False
+        endpoint_flip_done = False
         attempt = 0
 
         while attempt < 3:
@@ -2677,6 +2725,23 @@ class QQAdapter(BasePlatformAdapter):
                 )
             except Exception as exc:
                 last_exc = exc
+                flipped = self._flip_chat_type(chat_type)
+                if (
+                        not endpoint_flip_done
+                        and flipped
+                        and self._is_wrong_endpoint(exc)
+                ):
+                    endpoint_flip_done = True
+                    logger.warning(
+                        "[%s] chat id unknown on the %s endpoint, retrying on "
+                        "the %s endpoint: %s",
+                        self._log_tag,
+                        chat_type,
+                        flipped,
+                        exc,
+                    )
+                    chat_type = flipped
+                    continue
                 if (
                         reply_to
                         and not anchor_fallback_done
@@ -2693,7 +2758,7 @@ class QQAdapter(BasePlatformAdapter):
                     continue
                 err = str(exc).lower()
                 # Permanent errors — don't retry
-                if any(
+                if self._is_wrong_endpoint(exc) or any(
                         k in err
                         for k in ("invalid", "forbidden", "not found", "bad request")
                 ):
@@ -2713,9 +2778,13 @@ class QQAdapter(BasePlatformAdapter):
 
         error_msg = (str(last_exc) or type(last_exc).__name__) if last_exc else "Unknown error"
         logger.error("[%s] Send failed: %s", self._log_tag, error_msg)
-        if last_exc is not None and self._is_reply_anchor_dead(last_exc):
-            # The anchor is unusable even for the active-message fallback; a
-            # gateway retry would only replay the same dead msg_id.
+        if last_exc is not None and (
+                self._is_reply_anchor_dead(last_exc)
+                or self._is_wrong_endpoint(last_exc)
+        ):
+            # Both recoveries already ran and failed: the anchor is unusable and
+            # neither endpoint knows this chat id. Non-retryable so the gateway
+            # (and the delivery ledger) drops it instead of replaying it.
             return SendResult(success=False, error=error_msg, retryable=False)
         retryable = not any(
             k in error_msg.lower() for k in ("invalid", "forbidden", "not found")
@@ -2811,12 +2880,12 @@ class QQAdapter(BasePlatformAdapter):
         formatted = self.format_message(content)
         truncated = formatted[: self.MAX_MESSAGE_LENGTH]
 
-        async def dispatch(anchor: Optional[str]) -> SendResult:
-            if chat_type == "c2c":
+        async def dispatch(anchor: Optional[str], kind: str) -> SendResult:
+            if kind == "c2c":
                 return await self._send_c2c_text(
                     chat_id, truncated, anchor, keyboard=keyboard,
                 )
-            if chat_type == "group":
+            if kind == "group":
                 return await self._send_group_text(
                     chat_id, truncated, anchor, keyboard=keyboard,
                 )
@@ -2824,26 +2893,40 @@ class QQAdapter(BasePlatformAdapter):
                 success=False,
                 error=(
                     f"Inline keyboards not supported for chat_type "
-                    f"{chat_type!r}"
+                    f"{kind!r}"
                 ),
                 retryable=False,
             )
 
         try:
-            return await dispatch(reply_to)
+            return await dispatch(reply_to, chat_type)
         except Exception as exc:
+            retry_anchor, retry_kind = reply_to, chat_type
             if reply_to and self._is_reply_anchor_dead(exc):
                 # Approval / update prompts carry the stored inbound msg_id,
                 # which expires while the agent is still working. Resend
                 # without it (keyboard kept) instead of losing the buttons.
+                retry_anchor = None
                 logger.warning(
                     "[%s] passive reply anchor rejected for keyboard message, "
                     "resending as active message: %s",
                     self._log_tag,
                     exc,
                 )
+            flipped = self._flip_chat_type(chat_type)
+            if flipped and self._is_wrong_endpoint(exc):
+                retry_kind = flipped
+                logger.warning(
+                    "[%s] chat id unknown on the %s endpoint for keyboard "
+                    "message, retrying on the %s endpoint: %s",
+                    self._log_tag,
+                    chat_type,
+                    flipped,
+                    exc,
+                )
+            if retry_anchor != reply_to or retry_kind != chat_type:
                 try:
-                    return await dispatch(None)
+                    return await dispatch(retry_anchor, retry_kind)
                 except Exception as retry_exc:
                     logger.error(
                         "[%s] send_with_keyboard failed: %s",
@@ -2853,7 +2936,10 @@ class QQAdapter(BasePlatformAdapter):
                     return SendResult(
                         success=False,
                         error=str(retry_exc) or type(retry_exc).__name__,
-                        retryable=not self._is_reply_anchor_dead(retry_exc),
+                        retryable=not (
+                            self._is_reply_anchor_dead(retry_exc)
+                            or self._is_wrong_endpoint(retry_exc)
+                        ),
                     )
             logger.error(
                 "[%s] send_with_keyboard failed: %s", self._log_tag, exc
@@ -3092,6 +3178,7 @@ class QQAdapter(BasePlatformAdapter):
             caption: Optional[str] = None,
             reply_to: Optional[str] = None,
             file_name: Optional[str] = None,
+            _chat_type_override: Optional[str] = None,
     ) -> SendResult:
         """Upload media and send as a native message.
 
@@ -3108,7 +3195,7 @@ class QQAdapter(BasePlatformAdapter):
             if not await self._wait_for_reconnection():
                 return SendResult(success=False, error="Not connected", retryable=True)
 
-        chat_type = self._guess_chat_type(chat_id)
+        chat_type = _chat_type_override or self._guess_chat_type(chat_id)
         if chat_type == "guild":
             # Guild channels don't support native media upload in the same way.
             return SendResult(
@@ -3218,6 +3305,27 @@ class QQAdapter(BasePlatformAdapter):
                 retryable=False,
             )
         except Exception as exc:
+            flipped = (
+                self._flip_chat_type(chat_type)
+                if (_chat_type_override is None and self._is_wrong_endpoint(exc))
+                else None
+            )
+            if flipped:
+                # The upload target follows the chat kind (files land on
+                # /v2/users or /v2/groups), so redo the whole thing — upload
+                # included — against the other endpoint instead of just the send.
+                logger.warning(
+                    "[%s] chat id unknown on the %s endpoint for media, "
+                    "retrying on the %s endpoint: %s",
+                    self._log_tag,
+                    chat_type,
+                    flipped,
+                    exc,
+                )
+                return await self._send_media(
+                    chat_id, media_source, file_type, kind, caption, reply_to,
+                    file_name, _chat_type_override=flipped,
+                )
             logger.error("[%s] Media send failed: %s", self._log_tag, exc)
             return SendResult(success=False, error=str(exc) or type(exc).__name__)
 
@@ -3390,6 +3498,55 @@ class QQAdapter(BasePlatformAdapter):
         if chat_id in self._chat_type_map:
             return self._chat_type_map[chat_id]
         return "c2c"
+
+    def _seed_chat_types_from_routing(self) -> int:
+        """Learn chat kinds from the gateway's routing table (once per connect).
+
+        ``_chat_type_map`` is otherwise filled only by inbound messages, so a
+        fresh process — a gateway restart — guesses ``c2c`` for a group chat id
+        and sends whatever the delivery ledger redelivers to the wrong endpoint
+        (40011028, "请求的资源不存在(用户/群已注销)"). The routing table holds
+        every chat the gateway has seen and its session keys carry the kind.
+
+        Session keys spell a private chat ``dm`` and put BOTH real groups and
+        guild channels under ``group``; a guild channel therefore gets tried on
+        the groups endpoint first — the same order it would get from the old
+        c2c guess, so nothing regresses, and ``_flip_chat_type`` covers the miss.
+        """
+        try:
+            import sqlite3
+
+            from hermes_constants import get_hermes_home
+
+            db_path = Path(get_hermes_home()) / "state.db"
+            if not db_path.exists():
+                return 0
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                rows = con.execute("SELECT session_key FROM gateway_routing").fetchall()
+            finally:
+                con.close()
+        except Exception as exc:
+            logger.debug("[%s] chat-type seed skipped: %s", self._log_tag, exc)
+            return 0
+
+        seeded = 0
+        for (session_key,) in rows:
+            parsed = self._parse_gateway_session_key(str(session_key or ""))
+            if not parsed or parsed.get("platform") != "qqbot":
+                continue
+            chat_id = str(parsed.get("chat_id") or "").strip()
+            chat_type = self._normalize_chat_type(parsed.get("chat_type", ""))
+            if chat_id and chat_type:
+                self._chat_type_map.setdefault(chat_id, chat_type)
+                seeded += 1
+        if seeded:
+            logger.info(
+                "[%s] Seeded %d chat type(s) from the gateway routing table",
+                self._log_tag,
+                seeded,
+            )
+        return seeded
 
     @staticmethod
     def _strip_at_mention(content: str) -> str:

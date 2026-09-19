@@ -9,6 +9,7 @@ This plugin registers platform `qqbot` and replaces Hermes' built-in QQ adapter 
 Visible behavior this fork changes:
 
 - **Long replies are no longer lost.** QQ only lets a bot reply "in thread" to your message for a limited time (5 minutes in groups, 60 in private chats) and for a limited number of replies. Once that lapses, the plugin now sends the same message as a standalone message instead of retrying a reference that can never work and dropping the reply. Text, approval/confirmation buttons, and images/voice/video/files all behave this way.
+- **A reply queued when the gateway restarts still arrives.** The bot knows which chats are groups and which are private chats from the gateway's routing table on startup, so a queued message is delivered to the right chat instead of being sent to a non-existent one and dropped.
 - **Approval and confirmation buttons work.** A click resolves the approval; before, a click could be rejected as unauthorized under a named profile, or the buttons were not sent at all and only a plain-text `/approve` prompt arrived.
 - **Per-member allowlist inside a group.** Besides allowing whole groups, you can restrict which members are allowed to trigger the bot.
 - **Rejected messages are logged** with sender, chat openid, the policy that rejected them and the original text, so you can find the openids to allowlist.
