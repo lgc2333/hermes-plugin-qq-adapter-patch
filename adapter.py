@@ -1180,9 +1180,15 @@ class QQAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _parse_gateway_session_key(session_key: str) -> Optional[Dict[str, str]]:
-        """Parse ``agent:main:<platform>:<chat_type>:<chat_id>[:<user_id>]``."""
+        """Parse ``agent:<namespace>:<platform>:<chat_type>:<chat_id>[:<user_id>]``.
+
+        The namespace slot carries the multiplex profile ("main" for the
+        default profile — see ``gateway.session._session_key_namespace``);
+        it takes no part in any authorization decision, so any non-empty
+        value is accepted and every later slot keeps its position.
+        """
         parts = str(session_key or "").split(":")
-        if len(parts) < 5 or parts[0] != "agent" or parts[1] != "main":
+        if len(parts) < 5 or parts[0] != "agent" or not parts[1]:
             return None
         parsed = {
             "platform": parts[2],
@@ -1206,7 +1212,9 @@ class QQAdapter(BasePlatformAdapter):
 
         chat_type = parsed.get("chat_type", "")
         chat_id = parsed.get("chat_id", "")
-        if chat_type == "c2c":
+        # Approval keys come from build_source (chat_type="dm"); update-prompt
+        # keys from event.scene ("c2c").
+        if chat_type in {"c2c", "dm"}:
             return bool(chat_id) and operator == chat_id
 
         if chat_type in {"group", "guild"}:
