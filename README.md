@@ -6,33 +6,12 @@ This plugin registers platform `qqbot` and replaces Hermes' built-in QQ adapter 
 
 ## What is patched
 
-- ACL rejection logging at intake: rejected C2C / group / guild / guild-DM
-  messages are logged at INFO with the sender and chat openids, active policy,
-  reject reason and raw message content.
-- Group ACL config: env fallback `QQ_GROUP_ALLOW_FROM` for
-  `extra.group_allow_from`; new member-level filter for group messages via
-  `extra.group_member_allow_from` (env `QQ_GROUP_MEMBER_ALLOW_FROM`), enforced
-  after the group gate; unset list = any member.
-- Passive reply anchor fallback: when QQ rejects an outbound message because
-  its `msg_id` / `event_id` anchor is no longer usable (expired — 5 min in
-  group/channel, 60 min in C2C — or the passive reply quota for that message is
-  used up), the adapter drops the anchor and resends the same content once as
-  an ACTIVE message instead of retrying the dead anchor and silently dropping
-  the reply. Covers text (C2C / group / guild), keyboard messages (approval and
-  update prompts, keyboard kept — they bypass the text path entirely) and media
-  (the uploaded `file_info` is reused, never re-uploaded). The fallback fires at
-  most once per send, and a dead-anchor terminal failure is returned
-  non-retryable so the gateway does not replay the dead anchor.
-- Error-code plumbing the fallback needs: `_api_request` raises
-  `QQBotAPIError(RuntimeError)` carrying `err_code` (the message text keeps its
-  old wording plus a trailing `(err_code=...)`). Anchor-death is classified by
-  code — 304026, 304027, 304103, 40034005, 40034024, 40034025, 40034026,
-  40034128 — with a message-text fallback for responses that omit the code.
-- Approval authz namespace sync: `_parse_gateway_session_key` accepts any
-  non-empty profile namespace (`agent:<profile>:qqbot:...`) instead of the
-  literal `main`, and `_is_authorized_interaction_for_session` accepts
-  `chat_type="dm"` alongside `"c2c"`. Without this, approval button clicks under
-  a named profile were rejected as unauthorized and the approval timed out.
+Visible behavior this fork changes:
+
+- **Long replies are no longer lost.** QQ only lets a bot reply "in thread" to your message for a limited time (5 minutes in groups, 60 in private chats) and for a limited number of replies. Once that lapses, the plugin now sends the same message as a standalone message instead of retrying a reference that can never work and dropping the reply. Text, approval/confirmation buttons, and images/voice/video/files all behave this way.
+- **Approval and confirmation buttons work under a named profile.** They used to be rejected as unauthorized: clicking did nothing and the approval timed out.
+- **Per-member allowlist inside a group.** Besides allowing whole groups, you can restrict which members are allowed to trigger the bot.
+- **Rejected messages are logged** with sender, chat openid, the policy that rejected them and the original text, so you can find the openids to allowlist.
 
 ## Compatibility
 
@@ -114,7 +93,7 @@ PYTHONPATH=/opt/hermes:$PWD /tmp/qq-test-venv/bin/python -m pytest tests -q
 
 `/opt/hermes/.venv` cannot run these tests: it is root-owned and ships no pytest.
 
-CI checks out Hermes `main` **unpinned**, so upstream drift breaks the upstream step before it breaks anything here. Reproduce that step locally instead of pushing to find out:
+CI checks out Hermes `main` **unpinned** on purpose, so an upstream change that breaks this fork shows up in CI. Reproduce that step locally instead of pushing to find out:
 
 ```bash
 mkdir -p /tmp/ci/tests/gateway && rm -rf /tmp/ci/gateway && cp -a /opt/hermes/gateway /tmp/ci/gateway
