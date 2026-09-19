@@ -63,6 +63,7 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    ExecApprovalPrompt,
     MessageEvent,
     MessageType,
     SendResult,
@@ -2865,52 +2866,49 @@ class QQAdapter(BasePlatformAdapter):
         )
 
     # ------------------------------------------------------------------
-    # Cross-adapter gateway contract — send_exec_approval + send_update_prompt
+    # Cross-adapter gateway contract — exec approval + update prompt
     # ------------------------------------------------------------------
     #
-    # These mirror the signatures that gateway/run.py detects on the adapter
-    # class (e.g. type(adapter).send_exec_approval, type(adapter).send_update_prompt)
-    # for button-based approval / update-confirm UX. Discord, Telegram, Slack,
-    # Matrix, and Feishu already implement the same contract.
+    # The base class owns ``send_exec_approval``: it builds the shared
+    # ``ExecApprovalPrompt`` (text + choice rows) and renders it through the
+    # ``_send_exec_approval_prompt`` hook implemented below. Overriding the
+    # *hook* is what makes ``supports_exec_approval_buttons()`` report True and
+    # keeps the runner on the button path — overriding ``send_exec_approval``
+    # itself silently disabled QQ's approval buttons in favour of the
+    # plain-text ``/approve`` fallback.
+    #
+    # ``send_update_prompt`` stays duck-typed (``run_notifications.py`` probes
+    # it with getattr).
 
-    async def send_exec_approval(
+    async def _send_exec_approval_prompt(
             self,
-            chat_id: str,
-            command: str,
-            session_key: str,
-            description: str = "dangerous command",
-            metadata: Optional[Dict[str, Any]] = None,
-        allow_permanent: bool = True,
-        allow_session: bool = True,
-        smart_denied: bool = False,
+            prompt: ExecApprovalPrompt,
     ) -> SendResult:
-        """Send a button-based exec-approval prompt for a dangerous command.
+        """Render the shared exec-approval prompt with QQ's 3-button keyboard.
 
-        Called by ``gateway/run.py``'s ``_approval_notify_sync`` when the
-        agent is blocked waiting for approval. Button clicks resolve via
-        :func:`tools.approval.resolve_gateway_approval` — dispatched by the
-        adapter's interaction callback (:meth:`_default_interaction_dispatch`).
+        Button clicks resolve via :func:`tools.approval.resolve_gateway_approval`
+        — dispatched by the adapter's interaction callback
+        (:meth:`_default_interaction_dispatch`).
         """
-        del metadata  # QQ doesn't have thread_id / DM targeting overrides.
-        del allow_session  # QQ's 3-button keyboard has no session tier (once/always/deny).
-        if smart_denied:
+        description = prompt.description
+        if prompt.smart_denied:
             description += " Owner override applies to this one operation only."
 
         # Use the reply-to message for passive-message context when we have one.
         # QQ requires a msg_id on outbound messages to a user we've never
         # seen; the last inbound msg_id is the natural choice.
-        msg_id = self._last_msg_id.get(chat_id)
+        msg_id = self._last_msg_id.get(prompt.chat_id)
 
         req = ApprovalRequest(
-            session_key=session_key,
+            session_key=prompt.session_key,
             title="Execute this command?",
             description=description,
-            command_preview=command,
+            command_preview=prompt.command,
             timeout_sec=self._APPROVAL_TIMEOUT_SECONDS,
-            allow_permanent=allow_permanent and not smart_denied,
+            allow_permanent="always" in prompt.choices,
         )
         return await self.send_approval_request(
-            chat_id, req, reply_to=msg_id,
+            prompt.chat_id, req, reply_to=msg_id,
         )
 
     _APPROVAL_TIMEOUT_SECONDS = 300  # matches gateway's default gateway_timeout
@@ -3382,9 +3380,17 @@ class QQAdapter(BasePlatformAdapter):
         return stripped
 
     def _open_dm_opted_in(self) -> bool:
-        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
-            return True
-        return _resolve_qq_secret("QQ_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+        """Whether open-DM intake is opted into for THIS profile.
+
+        Both names go through the scoped reader: under multiplex the raw
+        ``os.environ`` holds the DEFAULT profile's opt-in, which must neither
+        open a secondary bot nor mask the opt-in a secondary declares in its
+        own ``.env`` (upstream cbd03e6e).
+        """
+        return any(
+            _resolve_qq_secret(name, "").lower() in {"true", "1", "yes"}
+            for name in ("GATEWAY_ALLOW_ALL_USERS", "QQ_ALLOW_ALL_USERS")
+        )
 
     def _is_dm_allowed(self, user_id: str) -> bool:
         if self._dm_policy == "disabled":
