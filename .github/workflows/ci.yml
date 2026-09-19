@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# Hermes is pinned to the LATEST RELEASE TAG, resolved at run time, not to
+# `main`: the tag is the tree users actually run, while `main` moves fast
+# enough that a test merged hours ago fails this fork before the matching
+# upstream fix has been ported (seen 2026-09-20 with the QQ STT timeout test).
+# The resolved tag is printed in the run log.
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -18,10 +24,29 @@ jobs:
         with:
           path: plugin
 
+      - name: Resolve latest Hermes release tag
+        id: hermes_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(gh release view --repo NousResearch/hermes-agent --json tagName --jq .tagName 2>/dev/null || true)"
+          if [ -z "$tag" ]; then
+            tag="$(git ls-remote --tags --refs --sort=-v:refname \
+              https://github.com/NousResearch/hermes-agent.git 2>/dev/null \
+              | head -n1 | sed 's#.*refs/tags/##')"
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::could not resolve a Hermes release tag"
+            exit 1
+          fi
+          echo "Hermes release tag: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
       - name: Checkout Hermes
         uses: actions/checkout@v4
         with:
           repository: NousResearch/hermes-agent
+          ref: ${{ steps.hermes_release.outputs.tag }}
           path: hermes
 
       - name: Set up uv

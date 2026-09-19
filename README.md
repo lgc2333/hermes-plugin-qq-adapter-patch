@@ -93,17 +93,20 @@ PYTHONPATH=/opt/hermes:$PWD /tmp/qq-test-venv/bin/python -m pytest tests -q
 
 `/opt/hermes/.venv` cannot run these tests: it is root-owned and ships no pytest.
 
-CI checks out Hermes `main` **unpinned** on purpose, so an upstream change that breaks this fork shows up in CI. Reproduce that step locally instead of pushing to find out:
+CI tests against the **latest Hermes release tag**, resolved at run time — the tag is the tree actually deployed, and upstream `main` moves too fast (a test merged hours ago fails this fork before the matching fix is ported). The resolved tag is printed in the CI log. Reproduce that step locally instead of pushing to find out:
 
 ```bash
+TAG=$(gh release view -R NousResearch/hermes-agent --json tagName --jq .tagName)
 mkdir -p /tmp/ci/tests/gateway && rm -rf /tmp/ci/gateway && cp -a /opt/hermes/gateway /tmp/ci/gateway
 cp adapter.py /tmp/ci/gateway/platforms/qqbot/adapter.py
 for f in test_qqbot.py test_qqbot_credential_isolation.py test_qqbot_scope_paths.py conftest.py; do
-  gh api -H "Accept: application/vnd.github.raw" "repos/NousResearch/hermes-agent/contents/tests/gateway/$f?ref=main" > "/tmp/ci/tests/gateway/$f"
+  gh api -H "Accept: application/vnd.github.raw" "repos/NousResearch/hermes-agent/contents/tests/gateway/$f?ref=$TAG" > "/tmp/ci/tests/gateway/$f"
 done
-gh api -H "Accept: application/vnd.github.raw" "repos/NousResearch/hermes-agent/contents/tests/conftest.py?ref=main" > /tmp/ci/tests/conftest.py
+gh api -H "Accept: application/vnd.github.raw" "repos/NousResearch/hermes-agent/contents/tests/conftest.py?ref=$TAG" > /tmp/ci/tests/conftest.py
 cd /tmp/ci && PYTHONPATH=/tmp/ci:/opt/hermes /tmp/qq-test-venv/bin/python -m pytest tests/gateway/test_qqbot.py tests/gateway/test_qqbot_credential_isolation.py tests/gateway/test_qqbot_scope_paths.py -q -o asyncio_mode=auto
 ```
+
+This runs your installed `gateway/` tree against the tag's tests, so the two must be the same release: `/opt/hermes/bin/hermes --version` prints it (`v0.21.3 (2026.9.14) · upstream 345cd2b0` at the time of writing — the same release as `v2026.9.14`).
 
 The overlay order matters: `/tmp/ci` must come first on `PYTHONPATH` so `gateway.platforms.qqbot.adapter` resolves to the copy with this plugin's `adapter.py`. The `rm -rf` keeps re-runs from nesting a second copy inside `/tmp/ci/gateway`; the `gh api` downloads are subject to GitHub rate limiting, so a repeated run can return HTTP 429 — wait a minute or reuse the files already under `/tmp/ci/tests`.
 
