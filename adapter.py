@@ -2535,6 +2535,49 @@ class QQAdapter(BasePlatformAdapter):
         except httpx.TimeoutException as exc:
             raise RuntimeError(f"QQ Bot API timeout [{path}]: {exc}") from exc
 
+    # Upload failures worth another attempt: transport trouble and QQ's own
+    # "server hiccup, try again later" codes. A business rejection (bad bytes,
+    # no permission, wrong id, content too long) fails the same way on a retry,
+    # so it is raised at once instead of burning the retry budget. The previous
+    # substring test on "400" swept every 4xx code — and the 5xx-family codes QQ
+    # returns inside a 400 response — into the no-retry bucket.
+    _UPLOAD_RETRYABLE_CODES = frozenset({
+        40034004,  # 富媒体信息转存失败 (请重试)
+        50055001,  # 消息发送异常，请稍后重试
+        50055006,  # ARK消息发送异常，请稍后重试
+    })
+
+    @classmethod
+    def _is_upload_retryable(cls, exc: BaseException) -> bool:
+        """Whether a failed upload is worth retrying (see the code set above)."""
+        if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+            # Connection dropped / timed out mid-upload: retry.
+            return True
+
+        code = getattr(exc, "err_code", None)
+        try:
+            code = int(code) if code is not None else None
+        except (TypeError, ValueError):
+            code = None
+        if code is not None:
+            # 5xxxxxxx band = QQ server-side failures ("请稍后重试").
+            return code in cls._UPLOAD_RETRYABLE_CODES or 50_000_000 <= code < 60_000_000
+
+        status = getattr(exc, "status", None)
+        try:
+            status = int(status) if status is not None else None
+        except (TypeError, ValueError):
+            status = None
+        if status is not None:
+            return status >= 500
+
+        # Transport-level failures arrive as plain RuntimeError: retry those.
+        text = str(exc).lower()
+        return any(
+            marker in text
+            for marker in ("timeout", "timed out", "connection", "reset", "稍后重试")
+        )
+
     async def _upload_media(
             self,
             target_type: str,
@@ -2563,18 +2606,16 @@ class QQAdapter(BasePlatformAdapter):
         if file_type == MEDIA_TYPE_FILE and file_name:
             body["file_name"] = file_name
 
-        # Retry transient upload failures
+        # Retry transient upload failures only — a business rejection of the same
+        # bytes is rejected again. Transport errors reach here as httpx
+        # exceptions (only timeouts are wrapped into RuntimeError upstream).
         for attempt in range(3):
             try:
                 return await self._api_request(
                     "POST", path, body, timeout=FILE_UPLOAD_TIMEOUT
                 )
-            except RuntimeError as exc:
-                err_msg = str(exc)
-                if any(
-                        kw in err_msg
-                        for kw in ("400", "401", "Invalid", "timeout", "Timeout")
-                ):
+            except (RuntimeError, httpx.HTTPError) as exc:
+                if not self._is_upload_retryable(exc):
                     raise
                 if attempt < 2:
                     await asyncio.sleep(1.5 * (attempt + 1))

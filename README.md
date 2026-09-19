@@ -24,6 +24,10 @@ Tested against the local Hermes source layout where QQ adapter support is availa
 gateway/platforms/qqbot/
 ```
 
+## Upstream baseline
+
+`adapter.py` is forked from upstream **v2026.8.31** (commit `29112bef`), the last release before upstream compacted that file on 2026-09-03 — so its length here is formatting, not extra features. Upstream fixes made after that release are ported deliberately: profile-namespace approval authz, the `_send_exec_approval_prompt` hook, the configurable STT timeout, and profile-scoped opt-in. The CI upstream step pins the **latest upstream release tag**.
+
 ## Install
 
 Use the active profile's `HERMES_HOME`. Do not hardcode `~/.hermes`.
@@ -71,6 +75,7 @@ QQ_GROUP_MEMBER_ALLOW_FROM=member_openid_1,member_openid_2
 
 Notes:
 
+- `QQ_GROUP_ALLOW_FROM` / `QQ_GROUP_MEMBER_ALLOW_FROM` are this plugin's own env names, deliberately clearer than the core bridge's `QQ_GROUP_ALLOWED_USERS`; they are read only when the matching `extra` key is absent.
 - `group_policy` and `dm_policy` have no env spelling; set them in `config.yaml`.
 - `*` wildcards are honored in both allowlists.
 - Rejected messages are logged at INFO with the group/member openid, reason
