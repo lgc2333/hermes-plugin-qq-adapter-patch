@@ -88,6 +88,69 @@ class QQCloseError(Exception):
         super().__init__(f"WebSocket closed (code={self.code}, reason={self.reason})")
 
 
+class QQBotAPIError(RuntimeError):
+    """QQ Bot REST API failure carrying the platform ``err_code``.
+
+    ``str(exc)`` keeps the historical ``RuntimeError`` wording (callers match
+    substrings such as ``[400]``, ``invalid``, ``timeout``), while the numeric
+    code travels as an attribute so outbound fallbacks can classify failures
+    by error code instead of by matching Chinese error strings.
+    """
+
+    def __init__(self, status: int, path: str, err_code: Any, message: Any):
+        self.status = int(status)
+        self.path = path
+        try:
+            self.err_code: Optional[int] = (
+                int(err_code) if err_code is not None else None
+            )
+        except (TypeError, ValueError):
+            self.err_code = None
+        self.api_message = str(message)
+        detail = f"QQ Bot API error [{self.status}] {path}: {message}"
+        if self.err_code is not None:
+            detail += f" (err_code={self.err_code})"
+        super().__init__(detail)
+
+
+# ---------------------------------------------------------------------------
+# Passive-reply anchor failures
+# ---------------------------------------------------------------------------
+#
+# QQ classifies an outbound message as PASSIVE only when it carries ``msg_id``
+# (reply to a user message) or ``event_id``; without them it is an ACTIVE
+# message. Passive anchors die: 5 minutes in group/频道, 60 minutes in C2C, and
+# each message only accepts a limited number of passive replies. Once dead, no
+# retry with the same anchor can ever succeed — the adapter must drop the
+# anchor and resend as an active message.
+#
+# Codes come from the official tables (send-message pages + api-call-guide):
+# https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html
+
+_REPLY_ANCHOR_DEAD_CODES = frozenset({
+    304026,    # MSG_ID 回复的消息 id 错误
+    304027,    # MSG_EXPIRE 回复的消息过期
+    304103,    # 消息ID已过期，不能回复
+    40034005,  # 回复消息msg_id已过期
+    40034024,  # 请求参数msg_id无效或越权
+    40034025,  # 请求参数event_id无效
+    40034026,  # 请求参数event_id已过期
+    40034128,  # 被动回复时间或次数超限
+})
+
+# Text fallbacks for responses that omit ``err_code``. Compared lowercased.
+_REPLY_ANCHOR_DEAD_MARKERS = (
+    "msg_id已过期",
+    "msgid已过期",
+    "msg_id expired",
+    "msgid expired",
+    "消息id已过期",
+    "被动回复时间或次数超限",
+    "msg_id无效",
+    "msg_id 无效",
+)
+
+
 # ---------------------------------------------------------------------------
 # Constants — imported from the shared constants module.
 # ---------------------------------------------------------------------------
@@ -2414,9 +2477,11 @@ class QQAdapter(BasePlatformAdapter):
             )
             data = resp.json()
             if resp.status_code >= 400:
-                raise RuntimeError(
-                    f"QQ Bot API error [{resp.status_code}] {path}: "
-                    f"{data.get('message', data)}"
+                raise QQBotAPIError(
+                    resp.status_code,
+                    path,
+                    data.get("err_code", data.get("code")),
+                    data.get("message", data),
                 )
             return data
         except httpx.TimeoutException as exc:
@@ -2528,30 +2593,74 @@ class QQAdapter(BasePlatformAdapter):
             reply_to = None
         return last_result
 
+    @staticmethod
+    def _is_reply_anchor_dead(exc: BaseException) -> bool:
+        """True when QQ rejected the passive reply anchor (msg_id/event_id).
+
+        Classified by ``err_code`` when the API returned one, with a
+        message-text fallback for responses that omit it.
+        """
+        if getattr(exc, "err_code", None) in _REPLY_ANCHOR_DEAD_CODES:
+            return True
+        text = str(exc).lower()
+        return any(marker in text for marker in _REPLY_ANCHOR_DEAD_MARKERS)
+
+    async def _dispatch_text_chunk(
+            self,
+            chat_type: str,
+            chat_id: str,
+            content: str,
+            reply_to: Optional[str],
+    ) -> SendResult:
+        """Send one text chunk to the endpoint matching ``chat_type``."""
+        if chat_type == "c2c":
+            return await self._send_c2c_text(chat_id, content, reply_to)
+        if chat_type == "group":
+            return await self._send_group_text(chat_id, content, reply_to)
+        if chat_type == "guild":
+            return await self._send_guild_text(chat_id, content, reply_to)
+        return SendResult(
+            success=False, error=f"Unknown chat type for {chat_id}"
+        )
+
     async def _send_chunk(
             self,
             chat_id: str,
             content: str,
             reply_to: Optional[str] = None,
     ) -> SendResult:
-        """Send a single chunk with retry + exponential backoff."""
+        """Send a single chunk with retry + exponential backoff.
+
+        A dead passive anchor (expired ``msg_id``, exhausted passive quota) is
+        never retried as-is: the chunk is resent once as an ACTIVE message
+        (``reply_to`` dropped), because the same anchor can only fail again.
+        """
         last_exc: Optional[Exception] = None
         chat_type = self._guess_chat_type(chat_id)
+        anchor_fallback_done = False
+        attempt = 0
 
-        for attempt in range(3):
+        while attempt < 3:
             try:
-                if chat_type == "c2c":
-                    return await self._send_c2c_text(chat_id, content, reply_to)
-                elif chat_type == "group":
-                    return await self._send_group_text(chat_id, content, reply_to)
-                elif chat_type == "guild":
-                    return await self._send_guild_text(chat_id, content, reply_to)
-                else:
-                    return SendResult(
-                        success=False, error=f"Unknown chat type for {chat_id}"
-                    )
+                return await self._dispatch_text_chunk(
+                    chat_type, chat_id, content, reply_to
+                )
             except Exception as exc:
                 last_exc = exc
+                if (
+                        reply_to
+                        and not anchor_fallback_done
+                        and self._is_reply_anchor_dead(exc)
+                ):
+                    anchor_fallback_done = True
+                    reply_to = None
+                    logger.warning(
+                        "[%s] passive reply anchor rejected, resending as "
+                        "active message: %s",
+                        self._log_tag,
+                        exc,
+                    )
+                    continue
                 err = str(exc).lower()
                 # Permanent errors — don't retry
                 if any(
@@ -2560,12 +2669,13 @@ class QQAdapter(BasePlatformAdapter):
                 ):
                     break
                 # Transient — back off and retry
-                if attempt < 2:
-                    delay = 1.0 * (2 ** attempt)
+                attempt += 1
+                if attempt < 3:
+                    delay = 1.0 * (2 ** (attempt - 1))
                     logger.warning(
                         "[%s] send retry %d/3 after %.1fs: %s",
                         self._log_tag,
-                        attempt + 1,
+                        attempt,
                         delay,
                         exc,
                     )
@@ -2573,6 +2683,10 @@ class QQAdapter(BasePlatformAdapter):
 
         error_msg = (str(last_exc) or type(last_exc).__name__) if last_exc else "Unknown error"
         logger.error("[%s] Send failed: %s", self._log_tag, error_msg)
+        if last_exc is not None and self._is_reply_anchor_dead(last_exc):
+            # The anchor is unusable even for the active-message fallback; a
+            # gateway retry would only replay the same dead msg_id.
+            return SendResult(success=False, error=error_msg, retryable=False)
         retryable = not any(
             k in error_msg.lower() for k in ("invalid", "forbidden", "not found")
         )
@@ -2666,14 +2780,15 @@ class QQAdapter(BasePlatformAdapter):
         chat_type = self._guess_chat_type(chat_id)
         formatted = self.format_message(content)
         truncated = formatted[: self.MAX_MESSAGE_LENGTH]
-        try:
+
+        async def dispatch(anchor: Optional[str]) -> SendResult:
             if chat_type == "c2c":
                 return await self._send_c2c_text(
-                    chat_id, truncated, reply_to, keyboard=keyboard,
+                    chat_id, truncated, anchor, keyboard=keyboard,
                 )
             if chat_type == "group":
                 return await self._send_group_text(
-                    chat_id, truncated, reply_to, keyboard=keyboard,
+                    chat_id, truncated, anchor, keyboard=keyboard,
                 )
             return SendResult(
                 success=False,
@@ -2683,7 +2798,33 @@ class QQAdapter(BasePlatformAdapter):
                 ),
                 retryable=False,
             )
+
+        try:
+            return await dispatch(reply_to)
         except Exception as exc:
+            if reply_to and self._is_reply_anchor_dead(exc):
+                # Approval / update prompts carry the stored inbound msg_id,
+                # which expires while the agent is still working. Resend
+                # without it (keyboard kept) instead of losing the buttons.
+                logger.warning(
+                    "[%s] passive reply anchor rejected for keyboard message, "
+                    "resending as active message: %s",
+                    self._log_tag,
+                    exc,
+                )
+                try:
+                    return await dispatch(None)
+                except Exception as retry_exc:
+                    logger.error(
+                        "[%s] send_with_keyboard failed: %s",
+                        self._log_tag,
+                        retry_exc,
+                    )
+                    return SendResult(
+                        success=False,
+                        error=str(retry_exc) or type(retry_exc).__name__,
+                        retryable=not self._is_reply_anchor_dead(retry_exc),
+                    )
             logger.error(
                 "[%s] send_with_keyboard failed: %s", self._log_tag, exc
             )
@@ -2995,15 +3136,27 @@ class QQAdapter(BasePlatformAdapter):
             if reply_to:
                 body["msg_id"] = reply_to
 
-            send_data = await self._api_request(
-                "POST",
-                (
-                    f"/v2/users/{chat_id}/messages"
-                    if chat_type == "c2c"
-                    else f"/v2/groups/{chat_id}/messages"
-                ),
-                body,
+            endpoint = (
+                f"/v2/users/{chat_id}/messages"
+                if chat_type == "c2c"
+                else f"/v2/groups/{chat_id}/messages"
             )
+            try:
+                send_data = await self._api_request("POST", endpoint, body)
+            except Exception as exc:
+                if not (reply_to and self._is_reply_anchor_dead(exc)):
+                    raise
+                # The upload already produced a valid file_info — drop the dead
+                # anchor and resend the same media as an active message instead
+                # of re-uploading it.
+                logger.warning(
+                    "[%s] passive reply anchor rejected for media message, "
+                    "resending as active message: %s",
+                    self._log_tag,
+                    exc,
+                )
+                body.pop("msg_id", None)
+                send_data = await self._api_request("POST", endpoint, body)
             return SendResult(
                 success=True,
                 message_id=str(send_data.get("id", uuid.uuid4().hex[:12])),
