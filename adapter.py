@@ -2286,14 +2286,31 @@ class QQAdapter(BasePlatformAdapter):
         )
         return wav_path
 
-    def _resolve_stt_config(self) -> Optional[Dict[str, str]]:
+    def _resolve_stt_config(self) -> Optional[Dict[str, Any]]:
         """Resolve STT backend configuration from config/environment.
 
         Priority:
         1. Plugin-specific: ``channels.qqbot.stt`` in config.yaml → ``self.config.extra["stt"]``
         2. QQ-specific env vars: ``QQ_STT_API_KEY`` / ``QQ_STT_BASE_URL`` / ``QQ_STT_MODEL``
         3. Return None if nothing is configured (STT will be skipped, QQ built-in ASR still works).
+
+        ``timeout`` (seconds) defaults to the shared STT client figure so a
+        self-hosted model's cold start is not cut off at 30s, and follows
+        ``stt.timeout`` when set (#112939).
         """
+        # Lazy import keeps the adapter light; the fallback covers a Hermes tree
+        # that predates the shared constant (the local 60s equals upstream's).
+        try:
+            from tools.transcription_common import DEFAULT_STT_TIMEOUT, _config_number
+        except ImportError:  # pragma: no cover - depends on the Hermes tree
+            DEFAULT_STT_TIMEOUT = 60.0
+
+            def _config_number(cfg, key, default, cast=float):
+                try:
+                    return cast(cfg.get(key, default))
+                except (TypeError, ValueError):
+                    return default
+
         extra = self.config.extra or {}
 
         # 1. Plugin-specific STT config (matches OpenClaw's channels.qqbot.stt)
@@ -2302,11 +2319,13 @@ class QQAdapter(BasePlatformAdapter):
             base_url = stt_cfg.get("baseUrl") or stt_cfg.get("base_url", "")
             api_key = stt_cfg.get("apiKey") or stt_cfg.get("api_key", "")
             model = stt_cfg.get("model", "")
+            timeout = _config_number(stt_cfg, "timeout", DEFAULT_STT_TIMEOUT)
             if base_url and api_key:
                 return {
                     "base_url": base_url.rstrip("/"),
                     "api_key": api_key,
                     "model": model or "whisper-1",
+                    "timeout": timeout,
                 }
             # Provider-only config: just model name, use default provider
             if api_key:
@@ -2324,6 +2343,7 @@ class QQAdapter(BasePlatformAdapter):
                         "api_key": api_key,
                         "model": model
                                  or ("glm-asr" if provider in {"zai", "glm"} else "whisper-1"),
+                        "timeout": timeout,
                     }
 
         # 2. QQ-specific env vars (set by `hermes setup gateway` / `hermes gateway`)
@@ -2338,6 +2358,7 @@ class QQAdapter(BasePlatformAdapter):
                 "base_url": base_url.rstrip("/"),
                 "api_key": qq_stt_key,
                 "model": model,
+                "timeout": DEFAULT_STT_TIMEOUT,
             }
 
         return None
@@ -2368,7 +2389,7 @@ class QQAdapter(BasePlatformAdapter):
                     headers={"Authorization": f"Bearer {api_key}"},
                     files={"file": (Path(wav_path).name, f, "audio/wav")},
                     data={"model": model},
-                    timeout=30.0,
+                    timeout=stt_cfg["timeout"],
                 )
             resp.raise_for_status()
             result = resp.json()
