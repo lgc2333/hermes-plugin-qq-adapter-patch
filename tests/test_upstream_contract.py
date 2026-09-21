@@ -103,28 +103,43 @@ class TestExecApprovalContract:
 
 
 class TestOptInScope:
-    """cbd03e6e：opt-in 只能按 profile 作用域读取。"""
+    """cbd03e6e：opt-in 只能按 profile 作用域读取。
+
+    fork 不再自带 `_open_dm_opted_in` —— 上游把它移进了
+    `OwnAccessPolicyMixin`，并且已经用作用域读取器实现（本 fork 无需再打补丁）。
+    下面两条钉住"用的是 mixin 的作用域实现、且两个 env 名都经它读取"。
+    """
+
+    def test_adapter_does_not_shadow_the_scoped_mixin_reader(self, adapter_module):
+        from gateway.platforms.access_policy_mixin import OwnAccessPolicyMixin
+
+        assert (
+            adapter_module.QQAdapter._open_dm_opted_in
+            is OwnAccessPolicyMixin._open_dm_opted_in
+        )
 
     def test_unscoped_env_does_not_open_intake(
-        self, adapter_module, adapter_instance, monkeypatch
+        self, adapter_instance, monkeypatch
     ):
+        import gateway.platforms.access_policy_mixin as mixin
+
         monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
-        monkeypatch.setattr(
-            adapter_module, "_resolve_qq_secret", lambda name, default="": ""
-        )
+        monkeypatch.setattr(mixin, "get_scoped_secret", lambda name, default="": "")
 
         assert adapter_instance._open_dm_opted_in() is False
 
     def test_both_names_are_read_through_the_scoped_reader(
-        self, adapter_module, adapter_instance, monkeypatch
+        self, adapter_instance, monkeypatch
     ):
+        import gateway.platforms.access_policy_mixin as mixin
+
         seen = []
 
-        def fake_resolve(name, default=""):
+        def fake_scoped(name, default=""):
             seen.append(name)
             return "YES" if name == "QQ_ALLOW_ALL_USERS" else ""
 
-        monkeypatch.setattr(adapter_module, "_resolve_qq_secret", fake_resolve)
+        monkeypatch.setattr(mixin, "get_scoped_secret", fake_scoped)
 
         assert adapter_instance._open_dm_opted_in() is True
         assert seen == ["GATEWAY_ALLOW_ALL_USERS", "QQ_ALLOW_ALL_USERS"]

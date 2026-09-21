@@ -26,7 +26,9 @@ gateway/platforms/qqbot/
 
 ## Upstream baseline
 
-`adapter.py` is forked from upstream **v2026.8.31** (commit `29112bef`), the last release before upstream compacted that file on 2026-09-03 — so its length here is formatting, not extra features. Upstream fixes made after that release are ported deliberately: profile-namespace approval authz, the `_send_exec_approval_prompt` hook, the configurable STT timeout, and profile-scoped opt-in. The CI upstream step pins the **latest upstream release tag**.
+`adapter.py` is forked from upstream **v2026.9.21** (commit `d337b736`), the release installed here: upstream's file with the patches below applied on top. Ports that used to live here are upstream's own now and are deliberately not duplicated — profile-namespace approval authz, the `_send_exec_approval_prompt` hook, the configurable STT timeout, profile-scoped opt-in, async media caching, and the configurable `gateway.trust_env`. The CI upstream step pins the **latest upstream release tag**.
+
+To re-fork on a later release: copy the new `gateway/platforms/qqbot/adapter.py` over this one and re-apply the patches below (the file gets restructured between releases, so a diff/merge is not meaningful).
 
 ## Install
 
@@ -87,14 +89,14 @@ Notes:
 The plugin's own tests need pytest, pytest-asyncio and the runtime deps the Hermes gateway package imports. A minimal venv works:
 
 ```bash
-uv venv /tmp/qq-test-venv --python 3.13
-uv pip install --python /tmp/qq-test-venv/bin/python pytest pytest-asyncio pyyaml aiohttp httpx websockets
+uv venv .venv --python 3.13
+uv pip install --python .venv/bin/python pytest pytest-asyncio pyyaml aiohttp httpx websockets psutil
 ```
 
 Then, from this repo:
 
 ```bash
-PYTHONPATH=/opt/hermes:$PWD /tmp/qq-test-venv/bin/python -m pytest tests -q
+PYTHONPATH=/opt/hermes:$PWD .venv/bin/python -m pytest tests -q
 ```
 
 `/opt/hermes/.venv` cannot run these tests: it is root-owned and ships no pytest.
@@ -105,14 +107,14 @@ CI tests against the **latest Hermes release tag**, resolved at run time — the
 TAG=$(gh release view -R NousResearch/hermes-agent --json tagName --jq .tagName)
 mkdir -p /tmp/ci/tests/gateway && rm -rf /tmp/ci/gateway && cp -a /opt/hermes/gateway /tmp/ci/gateway
 cp adapter.py /tmp/ci/gateway/platforms/qqbot/adapter.py
-for f in test_qqbot.py test_qqbot_credential_isolation.py test_qqbot_scope_paths.py conftest.py; do
+for f in test_qqbot.py test_qqbot_credential_isolation.py test_qqbot_scope_paths.py test_qqbot_update_prompt_key.py conftest.py; do
   gh api -H "Accept: application/vnd.github.raw" "repos/NousResearch/hermes-agent/contents/tests/gateway/$f?ref=$TAG" > "/tmp/ci/tests/gateway/$f"
 done
 gh api -H "Accept: application/vnd.github.raw" "repos/NousResearch/hermes-agent/contents/tests/conftest.py?ref=$TAG" > /tmp/ci/tests/conftest.py
-cd /tmp/ci && PYTHONPATH=/tmp/ci:/opt/hermes /tmp/qq-test-venv/bin/python -m pytest tests/gateway/test_qqbot.py tests/gateway/test_qqbot_credential_isolation.py tests/gateway/test_qqbot_scope_paths.py -q -o asyncio_mode=auto
+cd /tmp/ci && PYTHONPATH=/tmp/ci:/opt/hermes /tmp/qq-test-venv/bin/python -m pytest tests/gateway/test_qqbot.py tests/gateway/test_qqbot_credential_isolation.py tests/gateway/test_qqbot_scope_paths.py tests/gateway/test_qqbot_update_prompt_key.py -q -o asyncio_mode=auto
 ```
 
-This runs your installed `gateway/` tree against the tag's tests, so the two must be the same release: `/opt/hermes/bin/hermes --version` prints it (`v0.21.3 (2026.9.14) · upstream 345cd2b0` at the time of writing — the same release as `v2026.9.14`).
+This runs your installed `gateway/` tree against the tag's tests, so the two must be the same release: `/opt/hermes/bin/hermes --version` prints it (`v0.21.4 (2026.9.21) · upstream d337b736` at the time of writing — the same release as `v2026.9.21`).
 
 The overlay order matters: `/tmp/ci` must come first on `PYTHONPATH` so `gateway.platforms.qqbot.adapter` resolves to the copy with this plugin's `adapter.py`. The `rm -rf` keeps re-runs from nesting a second copy inside `/tmp/ci/gateway`; the `gh api` downloads are subject to GitHub rate limiting, so a repeated run can return HTTP 429 — wait a minute or reuse the files already under `/tmp/ci/tests`.
 
@@ -122,6 +124,7 @@ The GitHub Actions workflow checks out Hermes, installs its dev + messaging depe
 tests/gateway/test_qqbot.py
 tests/gateway/test_qqbot_credential_isolation.py
 tests/gateway/test_qqbot_scope_paths.py
+tests/gateway/test_qqbot_update_prompt_key.py
 ```
 
 Finally, it runs this plugin's own regression tests.

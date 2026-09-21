@@ -61,13 +61,17 @@ class TestEndpointFlip:
     ):
         calls = []
 
-        async def fake_dispatch(chat_type, chat_id, content, reply_to):
-            calls.append(chat_type)
-            if chat_type == "c2c":
-                raise wrong_endpoint_error(adapter_module)
+        async def fake_c2c(chat_id, content, reply_to=None, keyboard=None):
+            calls.append("c2c")
+            raise wrong_endpoint_error(adapter_module)
+
+        async def fake_group(chat_id, content, reply_to=None, keyboard=None):
+            calls.append("group")
             return SendResult(success=True, message_id="m1")
 
-        adapter_instance._dispatch_text_chunk = fake_dispatch
+        adapter_instance._send_c2c_text = fake_c2c
+        adapter_instance._send_group_text = fake_group
+
         result = await adapter_instance._send_chunk("GROUP", "hello")
 
         assert result.success is True
@@ -78,11 +82,17 @@ class TestEndpointFlip:
     ):
         calls = []
 
-        async def fake_dispatch(chat_type, chat_id, content, reply_to):
-            calls.append(chat_type)
+        async def fake_c2c(chat_id, content, reply_to=None, keyboard=None):
+            calls.append("c2c")
             raise wrong_endpoint_error(adapter_module)
 
-        adapter_instance._dispatch_text_chunk = fake_dispatch
+        async def fake_group(chat_id, content, reply_to=None, keyboard=None):
+            calls.append("group")
+            raise wrong_endpoint_error(adapter_module)
+
+        adapter_instance._send_c2c_text = fake_c2c
+        adapter_instance._send_group_text = fake_group
+
         result = await adapter_instance._send_chunk("GROUP", "hello")
 
         assert result.success is False
@@ -94,12 +104,13 @@ class TestEndpointFlip:
     ):
         calls = []
 
-        async def fake_dispatch(chat_type, chat_id, content, reply_to):
-            calls.append(chat_type)
+        async def fake_guild(chat_id, content, reply_to=None, keyboard=None):
+            calls.append("guild")
             raise wrong_endpoint_error(adapter_module)
 
-        adapter_instance._dispatch_text_chunk = fake_dispatch
+        adapter_instance._send_guild_text = fake_guild
         adapter_instance._chat_type_map = {"CHANNEL": "guild"}
+
         result = await adapter_instance._send_chunk("CHANNEL", "hello")
 
         assert result.success is False

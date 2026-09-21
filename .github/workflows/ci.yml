@@ -85,7 +85,7 @@ jobs:
         working-directory: hermes
         env:
           PYTHONPATH: ${{ github.workspace }}/hermes:${{ github.workspace }}/plugin
-        run: uv run pytest -q tests/gateway/test_qqbot.py tests/gateway/test_qqbot_credential_isolation.py tests/gateway/test_qqbot_scope_paths.py
+        run: uv run pytest -q tests/gateway/test_qqbot.py tests/gateway/test_qqbot_credential_isolation.py tests/gateway/test_qqbot_scope_paths.py tests/gateway/test_qqbot_update_prompt_key.py
 
       - name: Plugin tests
         working-directory: plugin
