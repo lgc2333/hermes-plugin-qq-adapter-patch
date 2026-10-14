@@ -26,9 +26,9 @@ gateway/platforms/qqbot/
 
 ## 上游基线
 
-`adapter.py` 取自上游 **v2026.9.21**（commit `d337b736`，即本机安装的版本），在其之上叠加本仓库的补丁。以前由本仓库移植的部分现在上游已自带，故不再重复：profile 命名空间的审批鉴权、`_send_exec_approval_prompt` 钩子、可配置的 STT 超时、按 profile 作用域的 opt-in、异步媒体缓存、可配置的 `gateway.trust_env`。CI 的上游测试步骤钉的是**上游最新 release tag**。
+`adapter.py` 取自上游 **v0.22.0**（commit `e06df9c2`），在其之上叠加本仓库的补丁。以前由本仓库移植的部分现在上游已自带，故不再重复：profile 命名空间的审批鉴权、`_send_exec_approval_prompt` 钩子、可配置的 STT 超时、按 profile 作用域的 opt-in、异步媒体缓存、可配置的 `gateway.trust_env`。CI 的上游测试步骤钉的是**上游最新 release tag**。
 
-以后跟随新版本时：把新的 `gateway/platforms/qqbot/adapter.py` 整份覆盖过来，再重新打上下面的补丁。该文件每次发布都可能被重构，所以 diff/merge 没有意义。导入原文件与打补丁分成两次提交，方便单独查看补丁。
+以后跟随新版本时：把新的 `gateway/platforms/qqbot/adapter.py` 整份覆盖过来，再重新打上本仓库的补丁。该文件每次发布都可能被重构，所以补丁点要逐个核对。导入原文件与打补丁分成两次提交，方便单独查看补丁。
 
 ## 安装
 
@@ -115,11 +115,11 @@ gh api -H "Accept: application/vnd.github.raw" "repos/NousResearch/hermes-agent/
 cd /tmp/ci && PYTHONPATH=/tmp/ci:/opt/hermes "$REPO/.venv/bin/python" -m pytest tests/gateway/test_qqbot.py tests/gateway/test_qqbot_credential_isolation.py tests/gateway/test_qqbot_scope_paths.py tests/gateway/test_qqbot_update_prompt_key.py -q -o asyncio_mode=auto
 ```
 
-这是拿本机安装的 `gateway/` 代码树去跑该 tag 的测试，所以两者必须是同一个 release：`/opt/hermes/bin/hermes --version` 会打印出来（写这份文档时是 `v0.21.4 (2026.9.21) · upstream d337b736`，即 `v2026.9.21`）。
+这是拿本机安装的 `gateway/` 代码树去跑该 tag 的测试，所以两者必须是同一个 release：`/opt/hermes/bin/hermes --version` 会打印出来（写这份文档时是 `v0.21.6 (2026.9.24) · upstream 818c13be`）。
 
 覆盖顺序很关键：`/tmp/ci` 必须排在 `PYTHONPATH` 最前面，`gateway.platforms.qqbot.adapter` 才会解析到带本插件 `adapter.py` 的那份。`rm -rf` 是为了避免重复执行时在 `/tmp/ci/gateway` 里再嵌一层副本；`gh api` 的下载受 GitHub 限流影响，反复执行可能返回 HTTP 429——等一分钟，或直接复用 `/tmp/ci/tests` 下已有的文件。
 
-GitHub Actions 的流程是：检出 Hermes，安装它的 dev + messaging 依赖，跑一次上游 QQ 适配器的导入冒烟测试，用 `hermes plugins doctor` 校验本目录插件，把 `adapter.py` 覆盖到 Hermes 的 `gateway/platforms/qqbot/adapter.py`，然后跑上游与 QQ 相关的测试：
+GitHub Actions 的流程是：检出 Hermes，安装它的 dev 依赖组与 messaging extra，跑一次上游 QQ 适配器的导入冒烟测试，用 `hermes plugins doctor` 校验本目录插件，把 `adapter.py` 覆盖到 Hermes 的 `gateway/platforms/qqbot/adapter.py`，然后跑上游与 QQ 相关的测试：
 
 ```text
 tests/gateway/test_qqbot.py

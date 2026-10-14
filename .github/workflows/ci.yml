@@ -52,14 +52,12 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-
+      # No actions/setup-python step: Hermes' pyproject pins its interpreter
+      # through `tool.uv.environments`, so `uv sync` provisions the locked
+      # CPython itself and a runner-provided python is simply ignored.
       - name: Install Hermes test dependencies
         working-directory: hermes
-        run: uv sync --locked --extra dev --extra messaging
+        run: uv sync --locked --group dev --group test --extra messaging
 
       - name: Upstream QQ adapter import smoke
         working-directory: hermes
