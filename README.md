@@ -89,8 +89,8 @@ QQ_GROUP_MEMBER_ALLOW_FROM=member_openid_1,member_openid_2
 插件自身的测试需要 pytest、pytest-asyncio，以及 Hermes gateway 包导入的运行时依赖。一个最小 venv 就够：
 
 ```bash
-uv venv .venv --python 3.13
-uv pip install --python .venv/bin/python pytest pytest-asyncio pyyaml aiohttp httpx websockets psutil
+uv venv .venv --python 3.14
+uv pip install --python .venv/bin/python pytest pytest-asyncio pyyaml ruamel.yaml aiohttp httpx websockets psutil
 ```
 
 然后在本仓库根目录执行：
@@ -115,7 +115,7 @@ gh api -H "Accept: application/vnd.github.raw" "repos/NousResearch/hermes-agent/
 cd /tmp/ci && PYTHONPATH=/tmp/ci:/opt/hermes "$REPO/.venv/bin/python" -m pytest tests/gateway/test_qqbot.py tests/gateway/test_qqbot_credential_isolation.py tests/gateway/test_qqbot_scope_paths.py tests/gateway/test_qqbot_update_prompt_key.py -q -o asyncio_mode=auto
 ```
 
-这是拿本机安装的 `gateway/` 代码树去跑该 tag 的测试，所以两者必须是同一个 release：`/opt/hermes/bin/hermes --version` 会打印出来（写这份文档时是 `v0.21.6 (2026.9.24) · upstream 818c13be`）。
+这是拿本机安装的 `gateway/` 代码树去跑该 tag 的测试，所以两者必须是同一个 release：`/opt/hermes/bin/hermes --version` 会打印出来（写这份文档时是 `v0.22.0 (2026.9.24) · upstream e06df9c2`）。
 
 覆盖顺序很关键：`/tmp/ci` 必须排在 `PYTHONPATH` 最前面，`gateway.platforms.qqbot.adapter` 才会解析到带本插件 `adapter.py` 的那份。`rm -rf` 是为了避免重复执行时在 `/tmp/ci/gateway` 里再嵌一层副本；`gh api` 的下载受 GitHub 限流影响，反复执行可能返回 HTTP 429——等一分钟，或直接复用 `/tmp/ci/tests` 下已有的文件。
 

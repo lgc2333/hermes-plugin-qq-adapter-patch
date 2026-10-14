@@ -3,7 +3,7 @@ name = "hermes-qq-adapter-patch"
 version = "1.1.0"
 description = "Hermes directory plugin patching the built-in QQ Bot adapter"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.15"
 license = "MIT"
 authors = [{ name = "lgc2333" }]
 
