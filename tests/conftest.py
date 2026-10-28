@@ -12,15 +12,27 @@ from gateway.config import Platform
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-ADAPTER_PATH = REPO_ROOT / "adapter.py"
+SOURCE_PACKAGE = REPO_ROOT / "qq_adapter_patch"
 
 
 def load_adapter_module():
-    spec = importlib.util.spec_from_file_location("qq_adapter_patch_test", ADAPTER_PATH)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    # Load the plugin as a PACKAGE and hand back the upstream source package's
+    # adapter module. The adapter uses relative imports for its siblings
+    # (constants/utils/chunked_upload/keyboards), so a bare module spec would
+    # break them; plugins_loader imports the plugin exactly this way.
+    name = "qq_adapter_patch_test"
+    key = f"{name}.qq_adapter_patch.adapter"
+    if key in sys.modules:
+        return sys.modules[key]
+    spec = importlib.util.spec_from_file_location(
+        name, REPO_ROOT / "__init__.py", submodule_search_locations=[str(REPO_ROOT)])
+    assert spec and spec.loader
+    package = importlib.util.module_from_spec(spec)
+    # spec_from_file_location does not set __package__ for a name without dots.
+    package.__package__ = name
+    sys.modules[name] = package
+    spec.loader.exec_module(package)
+    return sys.modules[key]
 
 
 @pytest.fixture()

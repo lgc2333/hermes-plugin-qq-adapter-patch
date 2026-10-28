@@ -59,12 +59,13 @@ jobs:
         working-directory: hermes
         run: uv sync --locked --group dev --group test --extra messaging
 
-      - name: Upstream QQ adapter import smoke
+      - name: Upstream QQ plugin import smoke
         working-directory: hermes
         run: |
           uv run python - <<'PY'
-          from gateway.platforms.qqbot import QQAdapter, check_qq_requirements
-          assert QQAdapter is not None
+          from plugins.platforms.qqbot import register
+          from plugins.platforms.qqbot.adapter import QQAdapter, check_qq_requirements
+          assert register is not None and QQAdapter is not None
           assert check_qq_requirements()
           print('upstream qqbot import smoke ok')
           PY
@@ -75,18 +76,22 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/hermes:${{ github.workspace }}/plugin
         run: uv run hermes plugins doctor ${{ github.workspace }}/plugin
 
-      - name: Install plugin adapter over upstream QQ adapter for upstream tests
+      - name: Install the fork over the upstream QQ plugin for upstream tests
         run: |
-          cp plugin/adapter.py hermes/gateway/platforms/qqbot/adapter.py
+          rm -rf hermes/plugins/platforms/qqbot
+          cp -a plugin/qq_adapter_patch hermes/plugins/platforms/qqbot
 
-      - name: Upstream QQ adapter tests with plugin adapter
+      - name: Upstream QQ plugin tests against the fork
         working-directory: hermes
         env:
-          PYTHONPATH: ${{ github.workspace }}/hermes:${{ github.workspace }}/plugin
+          PYTHONPATH: ${{ github.workspace }}/hermes
         run: uv run pytest -q tests/gateway/test_qqbot.py tests/gateway/test_qqbot_credential_isolation.py tests/gateway/test_qqbot_scope_paths.py tests/gateway/test_qqbot_update_prompt_key.py
 
       - name: Plugin tests
         working-directory: plugin
         env:
-          PYTHONPATH: ${{ github.workspace }}/hermes:${{ github.workspace }}/plugin
-        run: ${{ github.workspace }}/hermes/.venv/bin/python -m pytest -q tests
+          PYTHONPATH: ${{ github.workspace }}/hermes
+        # pytest's own entry point, not `python -m pytest`: the latter puts the
+        # plugin directory on sys.path, where top-level names could shadow
+        # Hermes modules.
+        run: ${{ github.workspace }}/hermes/.venv/bin/pytest -q tests

@@ -6,8 +6,6 @@ import logging
 import pytest
 from gateway.config import PlatformConfig
 
-from conftest import load_adapter_module
-
 
 def _make_adapter(adapter_module, extra, monkeypatch, env=None):
     for name in (

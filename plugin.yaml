@@ -1,10 +1,10 @@
 name: qq-adapter-patch
 label: QQ Bot adapter patch (fork)
 kind: platform
-version: 1.1.0
+version: 1.2.0
 description: >
-  Drop-in fork of the built-in QQ Bot adapter with fixes and features on top
-  of upstream.
+  Full-source fork of the built-in QQ Bot plugin: the whole upstream
+  platforms/qqbot package, with delivery and ACL fixes on top.
 author: lgc2333
 requires_env:
   - name: QQ_APP_ID
@@ -13,3 +13,10 @@ requires_env:
   - name: QQ_CLIENT_SECRET
     description: "QQ bot client secret"
     password: true
+optional_env:
+  - name: QQ_GROUP_ALLOW_FROM
+    description: "Comma-separated group OpenIDs allowed to trigger the bot (fork: also read from env, * allows all)"
+    password: false
+  - name: QQ_GROUP_MEMBER_ALLOW_FROM
+    description: "Comma-separated member OpenIDs allowed to trigger the bot inside allowed groups"
+    password: false

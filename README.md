@@ -1,8 +1,8 @@
 # Hermes QQ 适配器补丁
 
-Hermes 目录插件，用于官方 QQ 机器人适配器。
+Hermes 目录插件，官方 QQ 机器人插件的完整源码 fork。
 
-插件注册平台 `qqbot`，在运行时替换 Hermes 内置的 QQ 适配器，携带针对 QQ 群/私聊投递行为的本地修复。
+插件注册平台 `qqbot`，在运行时替换 Hermes 内置的 QQ 适配器，携带针对 QQ 群/私聊投递行为的本地修复。上游已把 QQ 适配器做成完整独立插件（`plugins/platforms/qqbot/`），所以这里直接 fork 整包源码，而不是只覆盖单个 `adapter.py`。
 
 ## 改了什么
 
@@ -14,21 +14,32 @@ Hermes 目录插件，用于官方 QQ 机器人适配器。
 - **群内支持成员白名单。** 除了放行整个群，还能限制只有哪些成员可以触发机器人。
 - **被拒绝的消息会记日志**，含发送者、会话 openid、拒绝它的策略和原文，方便你把 openid 加进白名单。
 
-## 兼容性
+## 目录结构
 
-这不是独立的 Python 程序，依赖 Hermes 的运行时模块（如 `gateway.*`、`gateway.platforms.qqbot.*`）。
-
-适配的 Hermes 源码布局中，QQ 适配器位于：
+上游整包源码放在 `qq_adapter_patch/`，与本仓库根目录分开，根层只留一个 `__init__.py`：
 
 ```text
-gateway/platforms/qqbot/
+qq-adapter-patch/
+  __init__.py            # 只转发 register，避免顶层模块遮蔽 Hermes 自己的模块
+  qq_adapter_patch/      # 上游 plugins/platforms/qqbot/ 的全部源码
+  plugin.yaml  README.md  pyproject.toml  tests/
+```
+
+`qq_adapter_patch/` 内除 `adapter.py` 外全部与上游同名文件一致；差异只在 `adapter.py` 的补丁部分，`git diff` 可直接看出补丁集。
+
+这不是独立的 Python 程序，依赖 Hermes 的运行时模块（如 `gateway.*`）。
+
+适配的 Hermes 源码布局中，QQ 插件位于：
+
+```text
+plugins/platforms/qqbot/
 ```
 
 ## 上游基线
 
-`adapter.py` 取自上游 **v0.22.0**（commit `e06df9c2`），在其之上叠加本仓库的补丁。以前由本仓库移植的部分现在上游已自带，故不再重复：profile 命名空间的审批鉴权、`_send_exec_approval_prompt` 钩子、可配置的 STT 超时、按 profile 作用域的 opt-in、异步媒体缓存、可配置的 `gateway.trust_env`。CI 的上游测试步骤钉的是**上游最新 release tag**。
+`qq_adapter_patch/` 取自上游 **v0.22.5**（commit `bf0203a7`），在其之上叠加本仓库的补丁。以前由本仓库移植的部分现在上游已自带，故不再重复：profile 命名空间的审批鉴权、`_send_exec_approval_prompt` 钩子、可配置的 STT 超时、按 profile 作用域的 opt-in、异步媒体缓存、可配置的 `gateway.trust_env`。CI 的上游测试步骤钉的是**上游最新 release tag**。
 
-以后跟随新版本时：把新的 `gateway/platforms/qqbot/adapter.py` 整份覆盖过来，再重新打上本仓库的补丁。该文件每次发布都可能被重构，所以补丁点要逐个核对。导入原文件与打补丁分成两次提交，方便单独查看补丁。
+以后跟随新版本时：把新 tag 的 `plugins/platforms/qqbot/` 整包覆盖到 `qq_adapter_patch/`，重新打上 `adapter.py` 的补丁。导入原包与打补丁分成两次提交，方便单独查看补丁。
 
 ## 安装
 
@@ -90,14 +101,16 @@ QQ_GROUP_MEMBER_ALLOW_FROM=member_openid_1,member_openid_2
 
 ```bash
 uv venv .venv --python 3.14
-uv pip install --python .venv/bin/python pytest pytest-asyncio pyyaml ruamel.yaml aiohttp httpx websockets psutil
+uv pip install --python .venv/bin/python pytest pytest-asyncio pyyaml ruamel.yaml aiohttp httpx websockets psutil python-dotenv
 ```
 
 然后在本仓库根目录执行：
 
 ```bash
-PYTHONPATH=/opt/hermes:$PWD .venv/bin/python -m pytest tests -q
+PYTHONPATH=/opt/hermes .venv/bin/pytest tests -q
 ```
+
+用 `.venv/bin/pytest` 而不是 `.venv/bin/python -m pytest`：后者把当前目录放进 `sys.path`，本仓库根的模块会盖住 Hermes 的同名模块。
 
 `/opt/hermes/.venv` 跑不了这些测试：它是 root 所有，且不带 pytest。
 
@@ -106,29 +119,29 @@ CI 对着**上游最新 release tag** 测试，tag 在运行时解析——那�
 ```bash
 REPO=$PWD
 TAG=$(gh release view -R NousResearch/hermes-agent --json tagName --jq .tagName)
-mkdir -p /tmp/ci/tests/gateway && rm -rf /tmp/ci/gateway && cp -a /opt/hermes/gateway /tmp/ci/gateway
-cp adapter.py /tmp/ci/gateway/platforms/qqbot/adapter.py
-for f in test_qqbot.py test_qqbot_credential_isolation.py test_qqbot_scope_paths.py test_qqbot_update_prompt_key.py conftest.py; do
-  gh api -H "Accept: application/vnd.github.raw" "repos/NousResearch/hermes-agent/contents/tests/gateway/$f?ref=$TAG" > "/tmp/ci/tests/gateway/$f"
-done
-gh api -H "Accept: application/vnd.github.raw" "repos/NousResearch/hermes-agent/contents/tests/conftest.py?ref=$TAG" > /tmp/ci/tests/conftest.py
-cd /tmp/ci && PYTHONPATH=/tmp/ci:/opt/hermes "$REPO/.venv/bin/python" -m pytest tests/gateway/test_qqbot.py tests/gateway/test_qqbot_credential_isolation.py tests/gateway/test_qqbot_scope_paths.py tests/gateway/test_qqbot_update_prompt_key.py -q -o asyncio_mode=auto
+rm -rf /tmp/ci && mkdir -p /tmp/ci/plugins/platforms
+git clone --depth 1 --branch "$TAG" --filter=blob:none --sparse \
+  https://github.com/NousResearch/hermes-agent.git /tmp/ci/hermes
+git -C /tmp/ci/hermes sparse-checkout set tests
+cp -a /opt/hermes/plugins/__init__.py /tmp/ci/plugins/
+cp -a /opt/hermes/plugins/platforms/__init__.py /tmp/ci/plugins/platforms/
+cp -a "$REPO/qq_adapter_patch" /tmp/ci/plugins/platforms/qqbot
+cd /tmp/ci/hermes
+HERMES_HOME=/var/tmp/hermes-ci-home PYTHONPATH=/tmp/ci:/opt/hermes \
+  "$REPO/.venv/bin/python" -m pytest -q -o asyncio_mode=auto \
+  tests/gateway/test_qqbot.py tests/gateway/test_qqbot_credential_isolation.py \
+  tests/gateway/test_qqbot_scope_paths.py tests/gateway/test_qqbot_update_prompt_key.py
 ```
 
-这是拿本机安装的 `gateway/` 代码树去跑该 tag 的测试，所以两者必须是同一个 release：`/opt/hermes/bin/hermes --version` 会打印出来（写这份文档时是 `v0.22.0 (2026.9.24) · upstream e06df9c2`）。
+这是拿本机安装的 Hermes 运行时去跑该 tag 的测试，所以安装树与 tag 必须是同一个 release：`/opt/hermes/bin/hermes --version` 会打印出来（写这份文档时是 `v0.22.5 (2026.9.24) · upstream bf0203a7`）。
 
-覆盖顺序很关键：`/tmp/ci` 必须排在 `PYTHONPATH` 最前面，`gateway.platforms.qqbot.adapter` 才会解析到带本插件 `adapter.py` 的那份。`rm -rf` 是为了避免重复执行时在 `/tmp/ci/gateway` 里再嵌一层副本；`gh api` 的下载受 GitHub 限流影响，反复执行可能返回 HTTP 429——等一分钟，或直接复用 `/tmp/ci/tests` 下已有的文件。
+几个只在本地出现的坑：
 
-GitHub Actions 的流程是：检出 Hermes，安装它的 dev 依赖组与 messaging extra，跑一次上游 QQ 适配器的导入冒烟测试，用 `hermes plugins doctor` 校验本目录插件，把 `adapter.py` 覆盖到 Hermes 的 `gateway/platforms/qqbot/adapter.py`，然后跑上游与 QQ 相关的测试：
+- `/tmp/ci` 必须排在 `PYTHONPATH` 最前面，`plugins.platforms.qqbot.*` 才会解析到本仓库那份；否则上游测试跑的是安装树里的原版适配器。
+- `HERMES_HOME` 要指到 `/opt/data` 之外，否则上游 `tests/home_io_guard.py` 会把影子目录判成真实 Hermes home，抛 `TEST BUG: file I/O against the REAL hermes home`。
+- 缺 `python-dotenv` 时，`test_qqbot_scope_paths.py` 会整片失败（`ModuleNotFoundError: No module named 'dotenv'`），与补丁无关。
 
-```text
-tests/gateway/test_qqbot.py
-tests/gateway/test_qqbot_credential_isolation.py
-tests/gateway/test_qqbot_scope_paths.py
-tests/gateway/test_qqbot_update_prompt_key.py
-```
-
-最后再跑本插件自己的回归测试。
+GitHub Actions 的流程是：检出 Hermes，安装它的 dev/test 依赖组与 messaging extra，跑一次上游 QQ 适配器的导入冒烟测试，用 `hermes plugins doctor` 校验本目录插件，把 `qq_adapter_patch/` 整包覆盖到 Hermes 的 `plugins/platforms/qqbot/`，然后跑上面四个上游测试文件，最后跑本插件自己的回归测试。
 
 ## 说明
 
