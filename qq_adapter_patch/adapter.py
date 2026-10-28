@@ -61,19 +61,45 @@ class QQCloseError(Exception):
         super().__init__(f"WebSocket closed (code={self.code}, reason={self.reason})")
 
 
+class QQBotAPIError(RuntimeError):
+    """QQ Bot REST API failure carrying the platform ``err_code``.
+
+    ``str(exc)`` keeps the historical ``RuntimeError`` wording (callers match
+    substrings such as ``[400]``, ``invalid``, ``timeout``), while the numeric
+    code travels as an attribute so outbound fallbacks can classify failures
+    by error code instead of by matching Chinese error strings.
+    """
+
+    def __init__(self, status: int, path: str, err_code: Any, message: Any):
+        self.status = int(status)
+        self.path = path
+        try:
+            self.err_code: Optional[int] = int(err_code) if err_code is not None else None
+        except (TypeError, ValueError):
+            self.err_code = None
+        self.api_message = str(message)
+        detail = f"QQ Bot API error [{self.status}] {path}: {message}"
+        if self.err_code is not None:
+            detail += f" (err_code={self.err_code})"
+        super().__init__(detail)
+
+
 from .constants import (
     API_BASE, TOKEN_URL, GATEWAY_URL_PATH, DEFAULT_API_TIMEOUT, FILE_UPLOAD_TIMEOUT,
     CONNECT_TIMEOUT_SECONDS, RECONNECT_BACKOFF, MAX_RECONNECT_ATTEMPTS, RATE_LIMIT_DELAY,
     QUICK_DISCONNECT_THRESHOLD, MAX_QUICK_DISCONNECT_COUNT, MAX_MESSAGE_LENGTH,
     DEDUP_WINDOW_SECONDS, DEDUP_MAX_SIZE, MSG_TYPE_TEXT, MSG_TYPE_MARKDOWN, MSG_TYPE_MEDIA,
-    MSG_TYPE_INPUT_NOTIFY, MEDIA_TYPE_IMAGE, MEDIA_TYPE_VIDEO, MEDIA_TYPE_VOICE, MEDIA_TYPE_FILE)
+    MSG_TYPE_INPUT_NOTIFY, MEDIA_TYPE_IMAGE, MEDIA_TYPE_VIDEO, MEDIA_TYPE_VOICE, MEDIA_TYPE_FILE,
+    # fork: send-side failure classification (see constants.py)
+    ENDPOINT_WRONG_CODES, ENDPOINT_WRONG_MARKERS,
+    REPLY_ANCHOR_DEAD_CODES, REPLY_ANCHOR_DEAD_MARKERS)
 from .utils import coerce_list as _coerce_list, build_user_agent
 from .chunked_upload import (
-    ChunkedUploader, UploadDailyLimitExceededError, UploadFileTooLargeError)
+    ChunkedUploader, UploadDailyLimitExceededError, UploadFileTooLargeError, is_upload_retryable)
 from .keyboards import (
     ApprovalRequest, InlineKeyboard, InteractionEvent, build_approval_keyboard,
-    build_update_prompt_keyboard, parse_approval_button_data, parse_interaction_event,
-    parse_update_prompt_button_data)
+    build_approval_text, build_update_prompt_keyboard, parse_approval_button_data,
+    parse_interaction_event, parse_update_prompt_button_data)
 from gateway.platforms._shared import get_scoped_secret as _resolve_qq_secret
 
 
@@ -152,7 +178,21 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._dm_policy = str(extra.get("dm_policy", "pairing")).strip().lower()
         self._allow_from = _coerce_list(extra.get("allow_from") or extra.get("allowFrom"))
         self._group_policy = str(extra.get("group_policy", "pairing")).strip().lower()
-        self._group_allow_from = _coerce_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
+        group_allow = _coerce_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
+        if not group_allow:
+            # Upstream declares QQ_GROUP_ALLOWED_USERS and bridges it into
+            # extra["group_allow_from"] (gateway_env.py); read it scoped so a
+            # secondary profile cannot be opened by the default profile's env.
+            # The older fork-only name stays honored for existing installs.
+            group_allow = _coerce_list(_resolve_qq_secret("QQ_GROUP_ALLOWED_USERS", ""))
+        if not group_allow:
+            group_allow = _coerce_list(_resolve_qq_secret("QQ_GROUP_ALLOW_FROM", ""))
+        self._group_allow_from = group_allow
+        group_members = _coerce_list(
+            extra.get("group_member_allow_from") or extra.get("groupMemberAllowFrom"))
+        if not group_members:
+            group_members = _coerce_list(_resolve_qq_secret("QQ_GROUP_MEMBER_ALLOW_FROM", ""))
+        self._group_member_allow_from = group_members
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
@@ -213,6 +253,10 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             self._mark_connected()
             logger.info("[%s] Connected", self._log_tag)
+            # A fresh process starts with an empty chat-type map; learn the kinds
+            # the gateway already knows so queued / redelivered sends hit the
+            # right endpoint instead of being guessed as c2c.
+            self._seed_chat_types_from_routing()
             self._wire_plugin_handlers(None)
             return True
         except Exception as exc:
@@ -738,7 +782,12 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     async def _handle_c2c_message(self, d, msg_id, content, author, timestamp) -> None:
         user_openid = str(author.get("user_openid", ""))
-        if not user_openid or not self._is_dm_intake_allowed(user_openid):
+        if not user_openid:
+            return
+        if not self._is_dm_intake_allowed(user_openid):
+            logger.info(
+                "[%s] C2C message rejected by ACL: user=%s policy=%s content=%r",
+                self._log_tag, user_openid, self._dm_policy, content)
             return
 
         attachments_raw = d.get("attachments")
@@ -762,7 +811,13 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     async def _handle_group_message(self, d, msg_id, content, author, timestamp) -> None:
         group_openid = str(d.get("group_openid", ""))
         member = str(author.get("member_openid", ""))
-        if not group_openid or not self._is_group_allowed(group_openid, member):
+        if not group_openid:
+            return
+        reason = self._group_acl_reject_reason(group_openid, member)
+        if reason:
+            logger.info(
+                "[%s] Group message rejected by ACL: group=%s member=%s reason=%s policy=%s content=%r",
+                self._log_tag, group_openid, member, reason, self._group_policy, content)
             return
         await self._ingest(
             d, msg_id, self._strip_at_mention(content), d.get("attachments"), timestamp,
@@ -776,8 +831,10 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         # member could bypass the allowlist.
         guild_id = str(d.get("guild_id", ""))
         author_id = str(author.get("id", ""))
-        if not self._is_group_allowed(guild_id or channel_id, author_id):
-            logger.debug("[%s] Guild message blocked by ACL: channel=%s user=%s", self._log_tag, channel_id, author_id)
+        if not self._is_group_allowed(guild_id or channel_id, author_id, check_member=False):
+            logger.info(
+                "[%s] Guild message rejected by ACL: guild=%s channel=%s user=%s policy=%s content=%r",
+                self._log_tag, guild_id, channel_id, author_id, self._group_policy, content)
             return
 
         member = d.get("member") if isinstance(d.get("member"), dict) else {}
@@ -793,7 +850,9 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         # dm_policy ACL — without it any guild member could bypass the allowlist via DM.
         author_id = str(author.get("id", ""))
         if not self._is_dm_intake_allowed(author_id):
-            logger.debug("[%s] Guild DM blocked by ACL: guild=%s user=%s", self._log_tag, guild_id, author_id)
+            logger.info(
+                "[%s] Guild DM rejected by ACL: guild=%s user=%s policy=%s content=%r",
+                self._log_tag, guild_id, author_id, self._dm_policy, content)
             return
         await self._ingest(
             d, msg_id, content, d.get("attachments"), timestamp,
@@ -1295,7 +1354,9 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             resp = await client.request(method, f"{API_BASE}{path}", headers=headers, json=body, timeout=timeout)
             data = resp.json()
             if resp.status_code >= 400:
-                raise RuntimeError(f"QQ Bot API error [{resp.status_code}] {path}: {data.get('message', data)}")
+                raise QQBotAPIError(
+                    resp.status_code, path, data.get("err_code", data.get("code")),
+                    data.get("message", data))
             return data
         except httpx.TimeoutException as exc:
             raise RuntimeError(f"QQ Bot API timeout [{path}]: {exc}") from exc
@@ -1304,6 +1365,11 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         """JSON REST headers with a fresh bot token."""
         token = await self._ensure_token()
         return {"Authorization": f"QQBot {token}", "Content-Type": "application/json", "User-Agent": build_user_agent()}
+
+    @staticmethod
+    def _is_upload_retryable(exc: BaseException) -> bool:
+        """Whether a failed upload is worth retrying (see chunked_upload.is_upload_retryable)."""
+        return is_upload_retryable(exc)
 
     async def _upload_media(
         self, target_type: str, target_id: str, file_type: int, url: Optional[str] = None,
@@ -1317,13 +1383,19 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             body["file_data"] = file_data
         if file_type == MEDIA_TYPE_FILE and file_name:
             body["file_name"] = file_name
-        for attempt in range(3):  # retry transient upload failures
+        # Retry transient upload failures only — a business rejection of the same
+        # bytes is rejected again. Transport errors reach here as httpx
+        # exceptions (only timeouts are wrapped into RuntimeError upstream).
+        for attempt in range(3):
             try:
                 return await self._api_request("POST", path, body, timeout=FILE_UPLOAD_TIMEOUT)
-            except RuntimeError as exc:
-                if attempt == 2 or any(kw in str(exc) for kw in ("400", "401", "Invalid", "timeout", "Timeout")):
+            except (RuntimeError, httpx.HTTPError) as exc:
+                if not self._is_upload_retryable(exc):
                     raise
-                await asyncio.sleep(1.5 * (attempt + 1))
+                if attempt < 2:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                else:
+                    raise
 
     _RECONNECT_WAIT_SECONDS = 15.0  # max wait for reconnection before giving up on send
     _RECONNECT_POLL_INTERVAL = 0.5  # is_connected poll interval while waiting
@@ -1373,25 +1445,92 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     _PERMANENT_SEND_ERRORS = ("invalid", "forbidden", "not found")
 
+    @staticmethod
+    def _is_reply_anchor_dead(exc: BaseException) -> bool:
+        """True when QQ rejected the passive reply anchor (msg_id/event_id).
+
+        Classified by ``err_code`` when the API returned one, with a
+        message-text fallback for responses that omit it.
+        """
+        if getattr(exc, "err_code", None) in REPLY_ANCHOR_DEAD_CODES:
+            return True
+        text = str(exc).lower()
+        return any(marker in text for marker in REPLY_ANCHOR_DEAD_MARKERS)
+
+    @staticmethod
+    def _is_wrong_endpoint(exc: BaseException) -> bool:
+        """True when QQ does not know the chat id on the endpoint we used.
+
+        Covers the guess-wrong-chat-kind case (a group id sent to ``/v2/users``
+        or the reverse); the caller flips the endpoint once instead of retrying.
+        """
+        if getattr(exc, "err_code", None) in ENDPOINT_WRONG_CODES:
+            return True
+        text = str(exc)
+        return any(marker in text for marker in ENDPOINT_WRONG_MARKERS)
+
+    @staticmethod
+    def _flip_chat_type(chat_type: str) -> Optional[str]:
+        """The other endpoint for ``chat_type``; None when there is no other."""
+        return {"c2c": "group", "group": "c2c"}.get(str(chat_type or ""))
+
     async def _send_chunk(self, chat_id: str, content: str, reply_to: Optional[str] = None) -> SendResult:
+        """Send one chunk with retry + exponential backoff.
+
+        Two one-shot recoveries run before the generic backoff: a dead passive
+        anchor (expired ``msg_id``, exhausted passive quota) is dropped and the
+        chunk resent as an ACTIVE message, and a wrong endpoint (chat id unknown
+        on this one) flips ``c2c``/``group`` once. Neither failure is retried
+        as-is — repeating them can never succeed.
+        """
         last_exc: Optional[Exception] = None
-        sender = self._text_sender(self._guess_chat_type(chat_id))
-        if sender is None:
-            return SendResult(success=False, error=f"Unknown chat type for {chat_id}")
-        for attempt in range(3):
+        chat_type = self._guess_chat_type(chat_id)
+        anchor_fallback_done = False
+        endpoint_flip_done = False
+        attempt = 0
+        while attempt < 3:
+            sender = self._text_sender(chat_type)
+            if sender is None:
+                return SendResult(success=False, error=f"Unknown chat type for {chat_id}")
             try:
                 return await sender(chat_id, content, reply_to)
             except Exception as exc:
                 last_exc = exc
-                if any(k in str(exc).lower() for k in self._PERMANENT_SEND_ERRORS + ("bad request",)):
-                    break  # permanent — don't retry
-                if attempt < 2:
-                    delay = 1.0 * (2 ** attempt)
-                    logger.warning("[%s] send retry %d/3 after %.1fs: %s", self._log_tag, attempt + 1, delay, exc)
+                flipped = self._flip_chat_type(chat_type)
+                if not endpoint_flip_done and flipped and self._is_wrong_endpoint(exc):
+                    endpoint_flip_done = True
+                    logger.warning(
+                        "[%s] chat id unknown on the %s endpoint, retrying on the %s endpoint: %s",
+                        self._log_tag, chat_type, flipped, exc)
+                    chat_type = flipped
+                    continue
+                if reply_to and not anchor_fallback_done and self._is_reply_anchor_dead(exc):
+                    anchor_fallback_done = True
+                    reply_to = None
+                    logger.warning(
+                        "[%s] passive reply anchor rejected, resending as active message: %s",
+                        self._log_tag, exc)
+                    continue
+                # Permanent — don't retry. A wrong endpoint is a business
+                # rejection whose one-shot flip has already run or is impossible.
+                if self._is_wrong_endpoint(exc) or any(
+                        k in str(exc).lower() for k in self._PERMANENT_SEND_ERRORS + ("bad request",)):
+                    break
+                # Transient — back off and retry
+                attempt += 1
+                if attempt < 3:
+                    delay = 1.0 * (2 ** (attempt - 1))
+                    logger.warning("[%s] send retry %d/3 after %.1fs: %s", self._log_tag, attempt, delay, exc)
                     await asyncio.sleep(delay)
 
         error_msg = (str(last_exc) or type(last_exc).__name__) if last_exc else "Unknown error"
         logger.error("[%s] Send failed: %s", self._log_tag, error_msg)
+        if last_exc is not None and (
+                self._is_reply_anchor_dead(last_exc) or self._is_wrong_endpoint(last_exc)):
+            # Both recoveries already ran and failed: the anchor is unusable and
+            # neither endpoint knows this chat id. Non-retryable so the gateway
+            # (and the delivery ledger) drops it instead of replaying it.
+            return SendResult(success=False, error=error_msg, retryable=False)
         retryable = not any(k in error_msg.lower() for k in self._PERMANENT_SEND_ERRORS)
         return SendResult(success=False, error=error_msg, retryable=retryable)
 
@@ -1449,18 +1588,51 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self, chat_id: str, content: str, keyboard: InlineKeyboard, reply_to: Optional[str] = None,
     ) -> SendResult:
         """Send ONE text message with an inline keyboard (no chunking — splitting
-        would orphan the buttons; keep bodies short). Guild chats are unsupported."""
+        would orphan the buttons; keep bodies short). Guild chats are unsupported.
+
+        A dead passive anchor would cost the whole card (buttons included), so it
+        is retried once without the anchor; a chat id unknown on this endpoint
+        flips once. Both are business rejections — no backoff replay.
+        """
         if not await self._ensure_connected():
             return self._NOT_CONNECTED
         chat_type = self._guess_chat_type(chat_id)
-        sender = self._text_sender(chat_type, keyboard_ok=True)
-        if sender is None:
-            return SendResult(
-                success=False, error=f"Inline keyboards not supported for chat_type {chat_type!r}", retryable=False)
         truncated = self.format_message(content)[: self.MAX_MESSAGE_LENGTH]
+
+        async def dispatch(anchor: Optional[str], kind: str) -> SendResult:
+            sender = self._text_sender(kind, keyboard_ok=True)
+            if sender is None:
+                return SendResult(
+                    success=False, error=f"Inline keyboards not supported for chat_type {kind!r}", retryable=False)
+            return await sender(chat_id, truncated, anchor, keyboard=keyboard)
+
         try:
-            return await sender(chat_id, truncated, reply_to, keyboard=keyboard)
+            return await dispatch(reply_to, chat_type)
         except Exception as exc:
+            retry_anchor, retry_kind = reply_to, chat_type
+            if reply_to and self._is_reply_anchor_dead(exc):
+                # Approval / update prompts carry the stored inbound msg_id, which
+                # expires while the agent is still working. Resend without it
+                # (keyboard kept) instead of losing the buttons.
+                retry_anchor = None
+                logger.warning(
+                    "[%s] passive reply anchor rejected for keyboard message, resending as active message: %s",
+                    self._log_tag, exc)
+            flipped = self._flip_chat_type(chat_type)
+            if flipped and self._is_wrong_endpoint(exc):
+                retry_kind = flipped
+                logger.warning(
+                    "[%s] chat id unknown on the %s endpoint for keyboard message, retrying on the %s endpoint: %s",
+                    self._log_tag, chat_type, flipped, exc)
+            if retry_anchor != reply_to or retry_kind != chat_type:
+                try:
+                    return await dispatch(retry_anchor, retry_kind)
+                except Exception as retry_exc:
+                    logger.error("[%s] send_with_keyboard failed: %s", self._log_tag, retry_exc)
+                    return SendResult(
+                        success=False, error=str(retry_exc) or type(retry_exc).__name__,
+                        retryable=not (self._is_reply_anchor_dead(retry_exc)
+                                       or self._is_wrong_endpoint(retry_exc)))
             logger.error("[%s] send_with_keyboard failed: %s", self._log_tag, exc)
             return SendResult(success=False, error=str(exc) or type(exc).__name__)
 
@@ -1468,7 +1640,6 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self, chat_id: str, req: ApprovalRequest, reply_to: Optional[str] = None) -> SendResult:
         """Send a 3-button approval request (allow-once / allow-always / deny);
         clicks come back as INTERACTION_CREATE decoded by parse_approval_button_data."""
-        from .keyboards import build_approval_text
         keyboard = build_approval_keyboard(req.session_key, allow_permanent=getattr(req, "allow_permanent", True))
         return await self.send_with_keyboard(chat_id, build_approval_text(req), keyboard, reply_to=reply_to)
 
@@ -1545,13 +1716,14 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     async def _send_media(
         self, chat_id: str, media_source: str, file_type: int, kind: str, caption: Optional[str] = None,
-        reply_to: Optional[str] = None, file_name: Optional[str] = None) -> SendResult:
+        reply_to: Optional[str] = None, file_name: Optional[str] = None,
+        _chat_type_override: Optional[str] = None) -> SendResult:
         """Upload media and send as a native message. HTTP(S) URLs → single ``POST
         .../files`` with ``url=`` (QQ fetches it). Local files → chunked upload
         (prepare / PUT parts / complete), up to the platform's ~100 MB per-file limit."""
         if not await self._ensure_connected():
             return self._NOT_CONNECTED
-        chat_type = self._guess_chat_type(chat_id)
+        chat_type = _chat_type_override or self._guess_chat_type(chat_id)
         if chat_type == "guild":
             return SendResult(success=False, error="Guild media send not supported via this path")
 
@@ -1573,7 +1745,20 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 body["content"] = caption[: self.MAX_MESSAGE_LENGTH]
             if reply_to:
                 body["msg_id"] = reply_to
-            return await self._post_message(self._messages_path(chat_type, chat_id), body)
+            path = self._messages_path(chat_type, chat_id)
+            try:
+                return await self._post_message(path, body)
+            except Exception as exc:
+                if not (reply_to and self._is_reply_anchor_dead(exc)):
+                    raise
+                # The upload already produced a valid file_info — drop the dead
+                # anchor and resend the same media as an active message instead
+                # of re-uploading it.
+                logger.warning(
+                    "[%s] passive reply anchor rejected for media message, resending as active message: %s",
+                    self._log_tag, exc)
+                body.pop("msg_id", None)
+                return await self._post_message(path, body)
         except UploadDailyLimitExceededError as exc:
             # Non-retryable quota hit; give the model actionable text.
             logger.warning("[%s] Daily upload limit exceeded for %s (%s)", self._log_tag, exc.file_name, exc.file_size_human)
@@ -1588,6 +1773,20 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 success=False, retryable=False,
                 error=f"{exc.file_name!r} ({exc.file_size_human}) exceeds the QQ per-file upload limit ({exc.limit_human}).")
         except Exception as exc:
+            flipped = (
+                self._flip_chat_type(chat_type)
+                if (_chat_type_override is None and self._is_wrong_endpoint(exc))
+                else None)
+            if flipped:
+                # The upload target follows the chat kind (files land on
+                # /v2/users or /v2/groups), so redo the whole thing — upload
+                # included — against the other endpoint instead of just the send.
+                logger.warning(
+                    "[%s] chat id unknown on the %s endpoint for media, retrying on the %s endpoint: %s",
+                    self._log_tag, chat_type, flipped, exc)
+                return await self._send_media(
+                    chat_id, media_source, file_type, kind, caption, reply_to, file_name,
+                    _chat_type_override=flipped)
             logger.error("[%s] Media send failed: %s", self._log_tag, exc)
             return SendResult(success=False, error=str(exc) or type(exc).__name__)
 
@@ -1653,12 +1852,96 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         return self._chat_type_map.get(chat_id, "c2c")
 
     @staticmethod
+    def _normalize_chat_type(chat_type: str) -> Optional[str]:
+        """Map a session-key chat kind onto this adapter's chat types.
+
+        Session keys spell a private chat ``dm`` (``build_source``); sends route
+        on ``c2c``. Guild channels and guild DMs keep their own kinds.
+        """
+        return {"dm": "c2c", "c2c": "c2c", "group": "group", "guild": "guild"}.get(
+            str(chat_type or "").strip().lower())
+
+    def _seed_chat_types_from_routing(self) -> int:
+        """Learn chat kinds from the gateway's routing table (once per connect).
+
+        ``_chat_type_map`` is otherwise filled only by inbound messages, so a
+        fresh process — a gateway restart — guesses ``c2c`` for a group chat id
+        and sends whatever the delivery ledger redelivers to the wrong endpoint
+        (40011028, "请求的资源不存在(用户/群已注销)"). The routing table holds
+        every chat the gateway has seen and its session keys carry the kind.
+
+        Session keys spell a private chat ``dm`` and put BOTH real groups and
+        guild channels under ``group``; a guild channel therefore gets tried on
+        the groups endpoint first — the same order it would get from the old c2c
+        guess, so nothing regresses, and ``_flip_chat_type`` covers the miss.
+        """
+        try:
+            import sqlite3
+
+            from hermes_constants import get_hermes_home
+
+            db_path = Path(get_hermes_home()) / "state.db"
+            if not db_path.exists():
+                return 0
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                rows = con.execute("SELECT session_key FROM gateway_routing").fetchall()
+            finally:
+                con.close()
+        except Exception as exc:
+            logger.debug("[%s] chat-type seed skipped: %s", self._log_tag, exc)
+            return 0
+
+        seeded = 0
+        for (session_key,) in rows:
+            parsed = self._parse_gateway_session_key(str(session_key or ""))
+            if not parsed or parsed.get("platform") != "qqbot":
+                continue
+            chat_id = str(parsed.get("chat_id") or "").strip()
+            chat_type = self._normalize_chat_type(parsed.get("chat_type", ""))
+            if chat_id and chat_type:
+                self._chat_type_map.setdefault(chat_id, chat_type)
+                seeded += 1
+        if seeded:
+            logger.info("[%s] Seeded %d chat type(s) from the gateway routing table", self._log_tag, seeded)
+        return seeded
+
+    @staticmethod
     def _strip_at_mention(content: str) -> str:
         return re.sub(r"^@\S+\s*", "", content.strip())
 
     def _entry_matches(self, entries: list[str], target: str) -> bool:
         normalized_target = str(target).strip().lower()
         return any(str(e).strip().lower() in ("*", normalized_target) for e in entries)
+
+    # ── Group ACL: per-member allowlist on top of the mixin's group allowlist ──
+    #
+    # The mixin only checks the group itself. This fork adds an optional
+    # member allowlist (``group_member_allow_from`` / ``QQ_GROUP_MEMBER_ALLOW_FROM``)
+    # so a stranger inside an allowed group can be kept out, plus a rejection
+    # reason for intake logging. Guild messages pass ``check_member=False``:
+    # guild members are not group members and would all be rejected.
+
+    def _group_acl_reject_reason(
+        self, group_id: str, user_id: str, *, check_member: bool = True
+    ) -> Optional[str]:
+        """Return why a group-context message is rejected, or None if allowed."""
+        policy = self._group_policy
+        if policy == "disabled":
+            return "policy_disabled"
+        if policy == "pairing":
+            return "policy_pairing"
+        if policy == "allowlist" and not self._entry_matches(self._group_allow_from, group_id):
+            return "group_not_in_allowlist"
+        if (check_member and self._group_member_allow_from
+                and not self._entry_matches(self._group_member_allow_from, user_id)):
+            return "member_not_in_allowlist"
+        if policy in {"allowlist", "open"}:
+            return None
+        return f"unknown_policy:{policy}"
+
+    def _is_group_allowed(self, group_id: str, user_id: str, *, check_member: bool = True) -> bool:
+        return self._group_acl_reject_reason(group_id, user_id, check_member=check_member) is None
 
     def _parse_qq_timestamp(self, raw: str) -> datetime:
         """Parse a QQ timestamp — ISO 8601 string (current) or integer ms (legacy)."""
@@ -1668,3 +1951,9 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             with contextlib.suppress(ValueError, TypeError):
                 return datetime.fromtimestamp(int(raw) / 1000, tz=UTC)
         return datetime.now(tz=UTC)
+
+
+# --- Plugin entry point ----------------------------------------------------
+# The upstream adapter module only defines ``QQAdapter``. This glue registers
+# it as a Hermes platform plugin that overrides the built-in ``qqbot``
+# adapter, keeping the upstream file itself byte-for-byte unchanged.

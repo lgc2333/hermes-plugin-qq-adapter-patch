@@ -16,13 +16,52 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List
 
-from .constants import FILE_UPLOAD_TIMEOUT
+from .constants import FILE_UPLOAD_TIMEOUT, UPLOAD_RETRYABLE_CODES
 
 logger = logging.getLogger(__name__)
 
 _BIZ_CODE_DAILY_LIMIT = 40093002  # upload_prepare: daily cumulative limit
 _BIZ_CODE_PART_RETRYABLE = 40093001  # upload_part_finish: transient
 _DEFAULT_CONCURRENT_PARTS = 1
+
+
+def is_upload_retryable(exc: BaseException) -> bool:
+    """Whether a failed upload is worth retrying (fork).
+
+    Transport trouble and QQ's own "server hiccup, try again later" codes retry;
+    a business rejection (bad bytes, no permission, wrong id, content too long)
+    fails identically on a retry, so it is raised at once instead of burning the
+    retry budget. Classification is by ``err_code``/``status``; text is only the
+    last resort — every QQ error string contains ``[400]``, so a substring test on
+    it would sweep business rejections and retryable 5xxxxxxx codes together.
+    """
+    try:
+        import httpx
+    except ImportError:  # httpx missing: text/status classification only
+        httpx = None  # type: ignore[assignment]
+    if httpx is not None and isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        # Connection dropped / timed out mid-upload: retry.
+        return True
+
+    code = getattr(exc, "err_code", None)
+    try:
+        code = int(code) if code is not None else None
+    except (TypeError, ValueError):
+        code = None
+    if code is not None:
+        # 5xxxxxxx band = QQ server-side failures ("请稍后重试").
+        return code in UPLOAD_RETRYABLE_CODES or 50_000_000 <= code < 60_000_000
+
+    status = getattr(exc, "status", None)
+    try:
+        status = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status = None
+    if status is not None:
+        return status >= 500
+
+    text = str(exc).lower()
+    return any(marker in text for marker in ("timeout", "timed out", "connection", "reset", "稍后重试"))
 _MAX_CONCURRENT_PARTS = 10
 _PART_UPLOAD_TIMEOUT = 300.0  # 5 minutes per COS PUT
 _PART_UPLOAD_MAX_RETRIES = 2

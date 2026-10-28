@@ -78,8 +78,12 @@ jobs:
 
       - name: Install the fork over the upstream QQ plugin for upstream tests
         run: |
-          rm -rf hermes/plugins/platforms/qqbot
-          cp -a plugin/qq_adapter_patch hermes/plugins/platforms/qqbot
+          # Overwrite the package SOURCES but keep the upstream plugin.yaml: bundled-platform
+          # discovery requires __init__.py AND plugin.yaml in the directory. Without it
+          # `bundled_authz("qqbot")` returns {} and the scope/authz tests fail on env names.
+          find hermes/plugins/platforms/qqbot -maxdepth 1 -name '*.py' -delete
+          cp -a plugin/qq_adapter_patch/*.py hermes/plugins/platforms/qqbot/
+          test -f hermes/plugins/platforms/qqbot/plugin.yaml
 
       - name: Upstream QQ plugin tests against the fork
         working-directory: hermes

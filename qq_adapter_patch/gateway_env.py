@@ -32,7 +32,12 @@ ENV_OVERRIDES = (
     EnvCred(
         Platform.QQBOT, (("QQ_APP_ID", "QQ_CLIENT_SECRET"),),
         optional=(("app_id", "QQ_APP_ID"), ("client_secret", "QQ_CLIENT_SECRET")),
-        optional_stripped=(("allow_from", "QQ_ALLOWED_USERS"), ("group_allow_from", "QQ_GROUP_ALLOWED_USERS")),
+        optional_stripped=(
+            ("allow_from", "QQ_ALLOWED_USERS"),
+            ("group_allow_from", "QQ_GROUP_ALLOWED_USERS"),
+            # fork: per-member allowlist inside an allowed group
+            ("group_member_allow_from", "QQ_GROUP_MEMBER_ALLOW_FROM"),
+        ),
         then=_home,
     ),
 )

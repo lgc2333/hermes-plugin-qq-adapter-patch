@@ -10,7 +10,6 @@ Hermes 目录插件，官方 QQ 机器人插件的完整源码 fork。
 
 - **长回复不再丢。** QQ 只允许机器人在限定时间内“回复”某条消息（群聊 5 分钟、私聊 60 分钟），且一条消息可被动回复的次数有限。超时后插件会把同一内容改成主动消息发出去，而不是拿着一个永远不可能成功的引用重试、最后把回复丢掉。文本、审批/确认按钮、图片/语音/视频/文件都是如此。
 - **网关重启后，排队中的群聊回复仍能送达。** 重启后适配器手上的会话类型表是空的，会把会话默认当成私聊：私聊恰好猜对，群聊的 openid 则会被发到私聊接口，被 QQ 拒绝（`40011028 请求的资源不存在`）后丢掉。现在启动时会从网关的路由表补全会话类型，排队的群消息因此发往正确的接口。**QQ 频道（guild）的这条链路暂时不修（没人用）**：路由表把频道记成 group，无法据它还原频道类型，重启后补投的频道消息仍会发错端点。
-- **审批与确认按钮可用。** 点击即可完成审批；此前在命名 profile 下点击可能被判为未授权，或者干脆没发按钮、只收到纯文本的 `/approve` 提示。
 - **群内支持成员白名单。** 除了放行整个群，还能限制只有哪些成员可以触发机器人。
 - **被拒绝的消息会记日志**，含发送者、会话 openid、拒绝它的策略和原文，方便你把 openid 加进白名单。
 
@@ -25,7 +24,14 @@ qq-adapter-patch/
   plugin.yaml  README.md  pyproject.toml  tests/
 ```
 
-`qq_adapter_patch/` 内除 `adapter.py` 外全部与上游同名文件一致；差异只在 `adapter.py` 的补丁部分，`git diff` 可直接看出补丁集。
+补丁按上游的文件职责落位，`git diff` 即可看出补丁集：
+
+- `adapter.py`：投递回退（被动回复锚点失效改发主动消息、端点猜错翻一次）、群 ACL（成员白名单与拒绝日志）、`QQBotAPIError`。
+- `constants.py`：QQ 的错误码集合（被动回复失效、端点错误、上传可重试）。
+- `chunked_upload.py`：上传失败是否值得重试的分类。
+- `gateway_env.py`：成员白名单的 env 声明，与上游的 `QQ_GROUP_ALLOWED_USERS` 并列。
+
+其余文件与上游一致。
 
 这不是独立的 Python 程序，依赖 Hermes 的运行时模块（如 `gateway.*`）。
 
@@ -37,7 +43,7 @@ plugins/platforms/qqbot/
 
 ## 上游基线
 
-`qq_adapter_patch/` 取自上游 **v0.22.5**（commit `bf0203a7`），在其之上叠加本仓库的补丁。以前由本仓库移植的部分现在上游已自带，故不再重复：profile 命名空间的审批鉴权、`_send_exec_approval_prompt` 钩子、可配置的 STT 超时、按 profile 作用域的 opt-in、异步媒体缓存、可配置的 `gateway.trust_env`。CI 的上游测试步骤钉的是**上游最新 release tag**。
+`qq_adapter_patch/` 取自上游 **v0.22.5**（commit `bf0203a7`），在其之上叠加本仓库的补丁。CI 的上游测试步骤钉的是**上游最新 release tag**。
 
 以后跟随新版本时：把新 tag 的 `plugins/platforms/qqbot/` 整包覆盖到 `qq_adapter_patch/`，重新打上 `adapter.py` 的补丁。导入原包与打补丁分成两次提交，方便单独查看补丁。
 
@@ -84,13 +90,14 @@ group_member_allow_from:
 对应的环境变量（仅在缺少 `extra` 键时才读取）：
 
 ```text
-QQ_GROUP_ALLOW_FROM=group_openid_1,group_openid_2
+QQ_GROUP_ALLOWED_USERS=group_openid_1,group_openid_2
 QQ_GROUP_MEMBER_ALLOW_FROM=member_openid_1,member_openid_2
 ```
 
 说明：
 
-- `QQ_GROUP_ALLOW_FROM` / `QQ_GROUP_MEMBER_ALLOW_FROM` 是本插件自定的 env 名，比核心桥接的 `QQ_GROUP_ALLOWED_USERS` 更直观；只在对应的 `extra` 键缺失时生效。
+- `QQ_GROUP_ALLOWED_USERS` 是上游声明的群白名单 env，由 `gateway_env.py` 桥接进 `extra["group_allow_from"]`；`QQ_GROUP_MEMBER_ALLOW_FROM` 是本插件新增的成员白名单 env，同样声明在 `gateway_env.py`。
+- 旧的自定义名 `QQ_GROUP_ALLOW_FROM` 仍然兼容，但请迁移到 `QQ_GROUP_ALLOWED_USERS`。
 - `group_policy` 与 `dm_policy` 没有 env 写法，请在 `config.yaml` 里设置。
 - 两个白名单都支持 `*` 通配。
 - 被拒绝的消息以 INFO 级别记录 group/member openid、原因（`group_not_in_allowlist` / `member_not_in_allowlist` 等）、策略和原文，可据此发现需要加白名单的 openid。
@@ -141,7 +148,7 @@ HERMES_HOME=/var/tmp/hermes-ci-home PYTHONPATH=/tmp/ci:/opt/hermes \
 - `HERMES_HOME` 要指到 `/opt/data` 之外，否则上游 `tests/home_io_guard.py` 会把影子目录判成真实 Hermes home，抛 `TEST BUG: file I/O against the REAL hermes home`。
 - 缺 `python-dotenv` 时，`test_qqbot_scope_paths.py` 会整片失败（`ModuleNotFoundError: No module named 'dotenv'`），与补丁无关。
 
-GitHub Actions 的流程是：检出 Hermes，安装它的 dev/test 依赖组与 messaging extra，跑一次上游 QQ 适配器的导入冒烟测试，用 `hermes plugins doctor` 校验本目录插件，把 `qq_adapter_patch/` 整包覆盖到 Hermes 的 `plugins/platforms/qqbot/`，然后跑上面四个上游测试文件，最后跑本插件自己的回归测试。
+GitHub Actions 的流程是：检出 Hermes，安装它的 dev/test 依赖组与 messaging extra，跑一次上游 QQ 适配器的导入冒烟测试，用 `hermes plugins doctor` 校验本目录插件，把 `qq_adapter_patch/*.py` 覆盖到 Hermes 的 `plugins/platforms/qqbot/`（**保留上游的 `plugin.yaml`**：Hermes 靠 `__init__.py` + `plugin.yaml` 认定内置平台，缺了它 `bundled_authz("qqbot")` 会返回空，scope/authz 测试就会红），然后跑上面四个上游测试文件，最后跑本插件自己的回归测试。
 
 ## 说明
 
