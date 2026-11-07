@@ -244,3 +244,85 @@ def test_reject_log_includes_reason(adapter_module, monkeypatch, caplog):
     assert "member_not_in_allowlist" in caplog.text
     assert "STRANGER" in caplog.text
     assert "hello" in caplog.text
+
+
+# ── 镜像特殊值 "~" ───────────────────────────────────────────────────────
+
+
+def test_mirror_token_expands_to_dm_allowlist(adapter_module, monkeypatch):
+    adapter = _make_adapter(
+        adapter_module,
+        {
+            "group_policy": "allowlist",
+            "group_allow_from": ["GROUP"],
+            "allow_from": ["U1", "U2"],
+            "group_member_allow_from": ["~"],
+        },
+        monkeypatch,
+    )
+
+    assert adapter._group_member_allow_from == ["U1", "U2"]
+    assert adapter._group_acl_reject_reason("GROUP", "U1") is None
+    assert adapter._group_acl_reject_reason("GROUP", "U3") == "member_not_in_allowlist"
+
+
+def test_mirror_token_merges_and_dedupes_explicit_entries(adapter_module, monkeypatch):
+    adapter = _make_adapter(
+        adapter_module,
+        {
+            "group_policy": "allowlist",
+            "group_allow_from": ["GROUP"],
+            "allow_from": ["U1", "U2"],
+            "group_member_allow_from": ["~", "U2", "EXTRA"],
+        },
+        monkeypatch,
+    )
+
+    assert adapter._group_member_allow_from == ["U1", "U2", "EXTRA"]
+    assert adapter._group_acl_reject_reason("GROUP", "EXTRA") is None
+    assert adapter._group_acl_reject_reason("GROUP", "U3") == "member_not_in_allowlist"
+
+
+def test_mirror_token_via_env(adapter_module, monkeypatch):
+    adapter = _make_adapter(
+        adapter_module,
+        {"group_policy": "allowlist", "group_allow_from": ["GROUP"], "allow_from": ["U1"]},
+        monkeypatch,
+        env={"QQ_GROUP_MEMBER_ALLOW_FROM": "~,U9"},
+    )
+
+    assert adapter._group_member_allow_from == ["U1", "U9"]
+
+
+def test_mirror_token_with_empty_dm_list_allows_any_member(adapter_module, monkeypatch, caplog):
+    with caplog.at_level(logging.WARNING):
+        adapter = _make_adapter(
+            adapter_module,
+            {
+                "group_policy": "allowlist",
+                "group_allow_from": ["GROUP"],
+                "group_member_allow_from": ["~"],
+            },
+            monkeypatch,
+        )
+
+    assert adapter._group_member_allow_from == []
+    assert adapter._group_acl_reject_reason("GROUP", "ANYONE") is None
+    assert "mirrors the DM allowlist" in caplog.text
+
+
+def test_mirror_token_is_whole_element_only(adapter_module, monkeypatch):
+    adapter = _make_adapter(
+        adapter_module,
+        {
+            "group_policy": "allowlist",
+            "group_allow_from": ["GROUP"],
+            "allow_from": ["U1"],
+            "group_member_allow_from": ["U~", "~U2"],
+        },
+        monkeypatch,
+    )
+
+    assert adapter._group_member_allow_from == ["U~", "~U2"]
+    assert adapter._group_acl_reject_reason("GROUP", "U~") is None
+    assert adapter._group_acl_reject_reason("GROUP", "U1") == "member_not_in_allowlist"

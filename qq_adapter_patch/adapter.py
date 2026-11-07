@@ -122,6 +122,24 @@ _STT_PROVIDER_BASE_URLS = {
     "glm": "https://open.bigmodel.cn/api/coding/paas/v4"}
 _AUDIO_URL_EXTENSIONS = {".silk", ".amr", ".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"}
 
+# A member-allowlist element equal to this token mirrors the DM allowlist
+# (``extra.allow_from`` / ``QQ_ALLOWED_USERS``). Whole-element match only: any other
+# entry is kept verbatim.
+MEMBER_MIRROR_TOKEN = "~"
+
+
+def expand_member_mirror(entries: list[str], mirror_source: list[str], log_tag: str = "QQBot") -> list[str]:
+    """Expand ``MEMBER_MIRROR_TOKEN`` into *mirror_source*, keeping explicit entries."""
+    if MEMBER_MIRROR_TOKEN not in entries:
+        return entries
+    explicit = [entry for entry in entries if entry != MEMBER_MIRROR_TOKEN]
+    if not mirror_source:
+        logger.warning(
+            "[%s] group member allowlist mirrors the DM allowlist ('%s') but that list is empty; "
+            "every group member stays allowed", log_tag, MEMBER_MIRROR_TOKEN)
+    return list(dict.fromkeys([*mirror_source, *explicit]))
+
+
 
 class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     """QQ Bot adapter backed by the official QQ Bot WebSocket Gateway + REST API."""
@@ -192,7 +210,8 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             extra.get("group_member_allow_from") or extra.get("groupMemberAllowFrom"))
         if not group_members:
             group_members = _coerce_list(_resolve_qq_secret("QQ_GROUP_MEMBER_ALLOW_FROM", ""))
-        self._group_member_allow_from = group_members
+        self._group_member_allow_from = expand_member_mirror(
+            group_members, self._allow_from, self._log_tag)
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
